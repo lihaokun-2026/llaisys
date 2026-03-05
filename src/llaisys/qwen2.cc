@@ -38,7 +38,6 @@ struct Qwen2Model {
 
     Qwen2Model(const LlaisysQwen2Meta &m, llaisysDeviceType_t dev)
         : meta(m), device(dev), cache_pos(0) {
-
         // Create embedding and output tensors
         in_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
         out_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
@@ -133,20 +132,17 @@ struct Qwen2Model {
                 auto k_cache_slice = k_cache[layer]->slice(0, cache_pos + i, cache_pos + i + 1);
                 auto v_cache_slice = v_cache[layer]->slice(0, cache_pos + i, cache_pos + i + 1);
 
-                // Copy to cache (using embedding as copy operation)
-                std::vector<int64_t> idx = {0};
-                auto idx_tensor = Tensor::create({1}, LLAISYS_DTYPE_I64, device);
-                idx_tensor->load(idx.data());
-
+                // Flatten to 1D and perform D2D copy
                 auto k_flat = k_slice->view({meta.nkvh * meta.dh});
                 auto v_flat = v_slice->view({meta.nkvh * meta.dh});
                 auto kc_flat = k_cache_slice->view({meta.nkvh * meta.dh});
                 auto vc_flat = v_cache_slice->view({meta.nkvh * meta.dh});
 
-                ops::embedding(kc_flat->view({1, meta.nkvh * meta.dh}), idx_tensor,
-                               k_flat->view({1, meta.nkvh * meta.dh}));
-                ops::embedding(vc_flat->view({1, meta.nkvh * meta.dh}), idx_tensor,
-                               v_flat->view({1, meta.nkvh * meta.dh}));
+                size_t copy_bytes = meta.nkvh * meta.dh * k_flat->elementSize();
+                core::context().runtime().api()->memcpy_sync(
+                    kc_flat->data(), k_flat->data(), copy_bytes, LLAISYS_MEMCPY_D2D);
+                core::context().runtime().api()->memcpy_sync(
+                    vc_flat->data(), v_flat->data(), copy_bytes, LLAISYS_MEMCPY_D2D);
             }
 
             // Get full KV from cache
@@ -199,9 +195,9 @@ struct Qwen2Model {
         auto logits = Tensor::create({1, meta.voc}, meta.dtype, device);
         ops::linear(logits, last_flat->view({1, meta.hs}), out_embed, nullptr);
 
-        // Argmax
+        // Argmax — max_val is always F32 because the CUDA kernel writes float
         auto max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device);
-        auto max_val = Tensor::create({1}, meta.dtype, device);
+        auto max_val = Tensor::create({1}, LLAISYS_DTYPE_F32, device);
         auto logits_flat = logits->view({meta.voc});
         ops::argmax(max_idx, max_val, logits_flat);
 

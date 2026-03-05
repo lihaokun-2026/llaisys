@@ -5,6 +5,10 @@
 
 #include "cpu/linear_cpu.hpp"
 
+#ifdef ENABLE_NVIDIA_API
+#include "nvidia/linear_cuda.cuh"
+#endif
+
 namespace llaisys::ops {
 void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     // 检查设备一致性
@@ -32,12 +36,6 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
     size_t in_features = in->shape()[1];
     size_t out_features = weight->shape()[0];
 
-    // 检查形状兼容性
-    // Y = X * W^T + b
-    // X: [batch_size, in_features]
-    // W: [out_features, in_features]
-    // b: [out_features]
-    // Y: [batch_size, out_features]
     CHECK_ARGUMENT(weight->shape()[1] == in_features,
                    "linear: weight's second dimension must match input's second dimension");
     CHECK_ARGUMENT(out->shape()[0] == batch_size,
@@ -49,14 +47,12 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
                        "linear: bias dimension must match weight's first dimension");
     }
 
-    // 检查所有张量都是连续的
     ASSERT(out->isContiguous() && in->isContiguous() && weight->isContiguous(),
            "linear: all tensors must be contiguous.");
     if (bias) {
         ASSERT(bias->isContiguous(), "linear: bias must be contiguous.");
     }
 
-    // 设置设备上下文
     llaisys::core::context().setDevice(out->deviceType(), out->deviceId());
 
     switch (out->deviceType()) {
@@ -66,8 +62,9 @@ void linear(tensor_t out, tensor_t in, tensor_t weight, tensor_t bias) {
                            out->dtype(), batch_size, in_features, out_features);
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
-        TO_BE_IMPLEMENTED();
-        return;
+        return nvidia::linear(out->data(), in->data(), weight->data(),
+                              bias ? bias->data() : nullptr,
+                              out->dtype(), batch_size, in_features, out_features);
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

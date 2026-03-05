@@ -6,6 +6,7 @@ from ..libllaisys import (
     LlaisysQwen2Meta,
     LlaisysQwen2Weights,
     llaisysQwen2Model_t,
+    llaisysDeviceType_t,
 )
 from ..tensor import Tensor
 from ctypes import c_int64, c_size_t, c_int, c_char, c_void_p, POINTER, addressof
@@ -27,7 +28,19 @@ class Qwen2:
         # Load config
         with open(model_path / "config.json", "r") as f:
             config = json.load(f)
-        
+
+        # Check device availability before allocating anything
+        api = LIB_LLAISYS.llaisysGetRuntimeAPI(llaisysDeviceType_t(device.value))
+        ndev = api.contents.get_device_count()
+        if ndev == 0:
+            raise RuntimeError(
+                f"No devices available for device type '{device.name}'. "
+                "Make sure the library is compiled with the correct backend "
+                "and the hardware is accessible."
+            )
+
+        self._device = device
+
         # Create meta
         meta = LlaisysQwen2Meta()
         meta.dtype = DataType.BF16.value
@@ -68,7 +81,6 @@ class Qwen2:
         
         self._meta = meta
     
-
     def _load_weight(self, name: str, data):
         """Load a single weight tensor"""
         # Convert to numpy array and keep alive during load
@@ -163,23 +175,28 @@ class Qwen2:
         top_p: float = 0.8,
         temperature: float = 0.8,
     ):
+        # Explicitly activate the correct device context before any C++ call.
+        # This is necessary because the thread-local Context is shared across
+        # calls and may have been switched by other code (e.g., HuggingFace).
+        LIB_LLAISYS.llaisysSetContextRuntime(llaisysDeviceType_t(self._device.value), c_int(0))
+
         # Convert inputs to token array
         input_tokens = (c_int64 * len(inputs))(*inputs)
-        
+
         # First forward pass with prompt
         next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
             self._model,
             input_tokens,
             len(inputs)
         )
-        
+
         # Generate tokens
         generated = list(inputs) + [next_token]
-        
+
         for _ in range(max_new_tokens - 1):
             if next_token == self._meta.end_token:
                 break
-            
+
             # Forward pass with single token
             token_array = (c_int64 * 1)(next_token)
             next_token = LIB_LLAISYS.llaisysQwen2ModelInfer(
@@ -188,11 +205,10 @@ class Qwen2:
                 1
             )
             generated.append(next_token)
-        
+
         return generated
     
     def __del__(self):
         if hasattr(self, "_model") and self._model is not None:
             LIB_LLAISYS.llaisysQwen2ModelDestroy(self._model)
             self._model = None
-
