@@ -70,13 +70,13 @@ class Qwen2:
         
         # Load weights from safetensors
         for file in sorted(model_path.glob("*.safetensors")):
-            print(f"Loading weights from {file.name}...")
+            # print(f"Loading weights from {file.name}...")
             with safe_open(file, framework="pt", device="cpu") as f:
                 for name in f.keys():
-                    print(f"  Loading {name}... ", end="", flush=True)
+                    # print(f"  Loading {name}... ", end="", flush=True)
                     tensor_data = f.get_tensor(name)
                     self._load_weight(name, tensor_data)
-                    print("OK")
+                    # print("OK")
         print("All weights loaded successfully!")
         
         self._meta = meta
@@ -85,7 +85,7 @@ class Qwen2:
         """Load a single weight tensor"""
         # Convert to numpy array and keep alive during load
         if isinstance(data, torch.Tensor):
-            print(f"shape={data.shape}, dtype={data.dtype}")
+            # print(f"shape={data.shape}, dtype={data.dtype}")
             if data.dtype == torch.bfloat16:
                 # For bfloat16, view as uint16 first, then convert to numpy
                 data_np = data.cpu().view(torch.uint16).numpy()
@@ -102,22 +102,22 @@ class Qwen2:
         if not data_np.flags['C_CONTIGUOUS']:
             data_np = np.ascontiguousarray(data_np)
         
-        print(f"numpy shape={data_np.shape}, dtype={data_np.dtype}, contiguous={data_np.flags['C_CONTIGUOUS']}")
+        # print(f"numpy shape={data_np.shape}, dtype={data_np.dtype}, contiguous={data_np.flags['C_CONTIGUOUS']}")
         data_ptr = c_void_p(data_np.ctypes.data)
-        print(f"data_ptr={data_ptr}")
+        # print(f"data_ptr={data_ptr}")
         
         weights = self._weights.contents
-        print(f"weights={weights}")
+        # print(f"weights={weights}")
         
         # Parse weight name
         if name == "model.embed_tokens.weight":
             tensor = Tensor(tensor=weights.in_embed)
-            print(f"tensor object created, calling load...")
+            # print(f"tensor object created, calling load...")
             tensor.load(data_ptr)
         elif name == "lm_head.weight":
-            print(f"Accessing weights.out_embed...")
+            # print(f"Accessing weights.out_embed...")
             tensor = Tensor(tensor=weights.out_embed)
-            print(f"tensor object created, calling load...")
+            # print(f"tensor object created, calling load...")
             tensor.load(data_ptr)
         elif name == "model.norm.weight":
             tensor = Tensor(tensor=weights.out_norm_w)

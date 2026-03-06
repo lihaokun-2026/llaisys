@@ -50,8 +50,6 @@ Context::~Context() {
 }
 
 void Context::setDevice(llaisysDeviceType_t device_type, int device_id) {
-    std::cerr << "[DEBUG] device_id=" << device_id
-              << std::endl;
     // If doest not match the current runtime.
     if (_current_runtime == nullptr || _current_runtime->deviceType() != device_type || _current_runtime->deviceId() != device_id) {
         // Use find() to avoid inserting an empty vector via operator[]
