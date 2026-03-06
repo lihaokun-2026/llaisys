@@ -3,7 +3,6 @@ from .tensor import llaisysTensor_t
 from ctypes import Structure, POINTER, c_size_t, c_float, c_int64, c_int, c_void_p
 
 
-
 class LlaisysQwen2Meta(Structure):
     _fields_ = [
         ("dtype", llaisysDataType_t),
@@ -44,7 +43,6 @@ class LlaisysQwen2Weights(Structure):
 llaisysQwen2Model_t = c_void_p
 
 
-
 def load_qwen2(lib):
     # llaisysQwen2ModelCreate
     lib.llaisysQwen2ModelCreate.argtypes = [
@@ -71,3 +69,25 @@ def load_qwen2(lib):
     ]
     lib.llaisysQwen2ModelInfer.restype = c_int64
 
+    # llaisysQwen2ModelInferSample
+    lib.llaisysQwen2ModelInferSample.argtypes = [
+        llaisysQwen2Model_t,
+        POINTER(c_int64),
+        c_size_t,
+        c_float,  # temperature
+        c_int,    # top_k
+        c_float,  # top_p
+    ]
+    lib.llaisysQwen2ModelInferSample.restype = c_int64
+
+    # llaisysQwen2ModelSetCachePos
+    lib.llaisysQwen2ModelSetCachePos.argtypes = [llaisysQwen2Model_t, c_size_t]
+    lib.llaisysQwen2ModelSetCachePos.restype = None
+
+    # llaisysQwen2ModelGetCachePos
+    lib.llaisysQwen2ModelGetCachePos.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2ModelGetCachePos.restype = c_size_t
+
+    # llaisysQwen2ModelResetCache
+    lib.llaisysQwen2ModelResetCache.argtypes = [llaisysQwen2Model_t]
+    lib.llaisysQwen2ModelResetCache.restype = None

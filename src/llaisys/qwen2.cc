@@ -5,10 +5,48 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstring>
 #include <memory>
+#include <numeric>
+#include <random>
 #include <vector>
 
 namespace llaisys {
+
+// ─── BF16/F16 → F32 bit-cast helpers（logit 类型转换，仅 CPU）───────────────
+static float bf16_to_f32(uint16_t bf16) {
+    uint32_t bits = static_cast<uint32_t>(bf16) << 16;
+    float result;
+    std::memcpy(&result, &bits, sizeof(float));
+    return result;
+}
+
+static float f16_to_f32(uint16_t h) {
+    uint32_t sign = (h >> 15) & 1u;
+    uint32_t exp = (h >> 10) & 0x1fu;
+    uint32_t mant = h & 0x3ffu;
+    uint32_t bits;
+    if (exp == 0u) {
+        if (mant == 0u) {
+            bits = sign << 31;
+        } else {
+            exp = 1u;
+            while (!(mant & 0x400u)) {
+                mant <<= 1u;
+                exp--;
+            }
+            mant &= 0x3ffu;
+            bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13u);
+        }
+    } else if (exp == 31u) {
+        bits = (sign << 31) | (0xffu << 23) | (mant << 13u);
+    } else {
+        bits = (sign << 31) | ((exp + 112u) << 23) | (mant << 13u);
+    }
+    float result;
+    std::memcpy(&result, &bits, sizeof(float));
+    return result;
+}
 
 struct Qwen2Model {
     LlaisysQwen2Meta meta;
@@ -35,9 +73,10 @@ struct Qwen2Model {
     std::vector<tensor_t> k_cache;
     std::vector<tensor_t> v_cache;
     size_t cache_pos;
+    std::mt19937 rng;
 
     Qwen2Model(const LlaisysQwen2Meta &m, llaisysDeviceType_t dev)
-        : meta(m), device(dev), cache_pos(0) {
+        : meta(m), device(dev), cache_pos(0), rng(std::random_device{}()) {
         // Create embedding and output tensors
         in_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
         out_embed = Tensor::create({meta.voc, meta.hs}, meta.dtype, device);
@@ -82,7 +121,8 @@ struct Qwen2Model {
         }
     }
 
-    int64_t infer(int64_t *token_ids, size_t ntoken) {
+    // 运行完整前向传播，更新 cache_pos，返回设备端 logits [voc]
+    tensor_t run_forward(int64_t *token_ids, size_t ntoken) {
         size_t seq_len = ntoken;
 
         // Create position ids
@@ -195,27 +235,114 @@ struct Qwen2Model {
         auto logits = Tensor::create({1, meta.voc}, meta.dtype, device);
         ops::linear(logits, last_flat->view({1, meta.hs}), out_embed, nullptr);
 
-        // Argmax — max_val is always F32 because the CUDA kernel writes float
+        // 更新 cache 位置并返回设备端 logits
+        cache_pos += seq_len;
+        return logits->view({meta.voc});
+    }
+
+    // ── Argmax 贪心解码（原行为）──────────────────────────────────────────────
+    int64_t infer(int64_t *token_ids, size_t ntoken) {
+        auto logits_flat = run_forward(token_ids, ntoken);
         auto max_idx = Tensor::create({1}, LLAISYS_DTYPE_I64, device);
         auto max_val = Tensor::create({1}, LLAISYS_DTYPE_F32, device);
-        auto logits_flat = logits->view({meta.voc});
         ops::argmax(max_idx, max_val, logits_flat);
-
-        // Get result
-        int64_t result;
         std::vector<int64_t> result_vec(1);
         core::context().runtime().api()->memcpy_sync(
             reinterpret_cast<std::byte *>(result_vec.data()),
-            max_idx->data(),
-            sizeof(int64_t),
-            LLAISYS_MEMCPY_D2H);
-        result = result_vec[0];
-
-        // Update cache position
-        cache_pos += seq_len;
-
-        return result;
+            max_idx->data(), sizeof(int64_t), LLAISYS_MEMCPY_D2H);
+        return result_vec[0];
     }
+
+    // ── 设备端 logits (BF16/F16/F32) → CPU float32 ───────────────────────────
+    void logits_to_f32_cpu(const tensor_t &logits_dev, std::vector<float> &out) {
+        out.resize(meta.voc);
+        if (meta.dtype == LLAISYS_DTYPE_F32) {
+            core::context().runtime().api()->memcpy_sync(
+                reinterpret_cast<std::byte *>(out.data()),
+                logits_dev->data(), meta.voc * sizeof(float), LLAISYS_MEMCPY_D2H);
+        } else {
+            std::vector<uint16_t> raw(meta.voc);
+            core::context().runtime().api()->memcpy_sync(
+                reinterpret_cast<std::byte *>(raw.data()),
+                logits_dev->data(), meta.voc * sizeof(uint16_t), LLAISYS_MEMCPY_D2H);
+            if (meta.dtype == LLAISYS_DTYPE_BF16) {
+                for (size_t i = 0; i < meta.voc; i++) {
+                    out[i] = bf16_to_f32(raw[i]);
+                }
+            } else {
+                for (size_t i = 0; i < meta.voc; i++) {
+                    out[i] = f16_to_f32(raw[i]);
+                }
+            }
+        }
+    }
+
+    // ── Temperature / Top-K / Top-P 采样（CPU 端）───────────────────────────
+    int64_t sample_token(const std::vector<float> &logits,
+                         float temperature, int top_k, float top_p) {
+        size_t voc = logits.size();
+        // 贪心 argmax
+        if (temperature <= 0.0f || top_k == 1) {
+            return static_cast<int64_t>(
+                std::max_element(logits.begin(), logits.end()) - logits.begin());
+        }
+        // 带温度的 Softmax
+        float max_l = *std::max_element(logits.begin(), logits.end());
+        std::vector<float> probs(voc);
+        float sum = 0.0f;
+        for (size_t i = 0; i < voc; i++) {
+            probs[i] = std::exp((logits[i] - max_l) / temperature);
+            sum += probs[i];
+        }
+        for (auto &p : probs) {
+            p /= sum;
+        }
+        // Top-K 截断
+        int k = (top_k > 0 && top_k < static_cast<int>(voc)) ? top_k : static_cast<int>(voc);
+        std::vector<size_t> idx(voc);
+        std::iota(idx.begin(), idx.end(), 0u);
+        std::partial_sort(idx.begin(), idx.begin() + k, idx.end(),
+                          [&](size_t a, size_t b) { return probs[a] > probs[b]; });
+        // Top-P Nucleus 截断
+        size_t cutoff = static_cast<size_t>(k);
+        if (top_p > 0.0f && top_p < 1.0f) {
+            float cum = 0.0f;
+            for (int i = 0; i < k; i++) {
+                cum += probs[idx[i]];
+                if (cum >= top_p) {
+                    cutoff = static_cast<size_t>(i) + 1;
+                    break;
+                }
+            }
+        }
+        // 重归一化后采样
+        sum = 0.0f;
+        for (size_t i = 0; i < cutoff; i++) {
+            sum += probs[idx[i]];
+        }
+        std::uniform_real_distribution<float> uni(0.0f, sum);
+        float r = uni(rng);
+        float cum = 0.0f;
+        for (size_t i = 0; i < cutoff; i++) {
+            cum += probs[idx[i]];
+            if (r < cum) {
+                return static_cast<int64_t>(idx[i]);
+            }
+        }
+        return static_cast<int64_t>(idx[cutoff - 1]);
+    }
+
+    // ── 采样解码 ─────────────────────────────────────────────────────────────
+    int64_t infer_sample(int64_t *token_ids, size_t ntoken,
+                         float temperature, int top_k, float top_p) {
+        auto logits_flat = run_forward(token_ids, ntoken);
+        std::vector<float> logits_cpu;
+        logits_to_f32_cpu(logits_flat, logits_cpu);
+        return sample_token(logits_cpu, temperature, top_k, top_p);
+    }
+
+    void set_cache_pos(size_t pos) { cache_pos = pos; }
+    size_t get_cache_pos() const { return cache_pos; }
 
     void reset_cache() {
         cache_pos = 0;
@@ -281,6 +408,25 @@ struct LlaisysQwen2Weights *llaisysQwen2ModelWeights(struct LlaisysQwen2Model *m
 int64_t llaisysQwen2ModelInfer(struct LlaisysQwen2Model *model_, int64_t *token_ids, size_t ntoken) {
     auto model = reinterpret_cast<llaisys::Qwen2Model *>(model_);
     return model->infer(token_ids, ntoken);
+}
+
+int64_t llaisysQwen2ModelInferSample(struct LlaisysQwen2Model *model_,
+                                     int64_t *token_ids, size_t ntoken,
+                                     float temperature, int top_k, float top_p) {
+    return reinterpret_cast<llaisys::Qwen2Model *>(model_)->infer_sample(
+        token_ids, ntoken, temperature, top_k, top_p);
+}
+
+void llaisysQwen2ModelSetCachePos(struct LlaisysQwen2Model *model_, size_t pos) {
+    reinterpret_cast<llaisys::Qwen2Model *>(model_)->set_cache_pos(pos);
+}
+
+size_t llaisysQwen2ModelGetCachePos(struct LlaisysQwen2Model *model_) {
+    return reinterpret_cast<llaisys::Qwen2Model *>(model_)->get_cache_pos();
+}
+
+void llaisysQwen2ModelResetCache(struct LlaisysQwen2Model *model_) {
+    reinterpret_cast<llaisys::Qwen2Model *>(model_)->reset_cache();
 }
 
 } // extern "C"
