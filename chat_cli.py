@@ -30,6 +30,29 @@ except ImportError:
     print("错误：请先安装 requests：pip install requests")
     sys.exit(1)
 
+# prompt_toolkit 能正确处理 CJK 双宽字符，退格不会错位
+try:
+    from prompt_toolkit import prompt as _pt_prompt
+    from prompt_toolkit.formatted_text import ANSI as _PT_ANSI
+    _USE_PT = True
+except ImportError:
+    _USE_PT = False
+
+import re as _re
+_STRIP_ANSI = _re.compile(r'\x1b\[[0-9;]*[mK]')
+
+def _input(prompt_ansi: str) -> str:
+    """
+    支持 CJK 宽字符退格的 input 封装。
+    优先使用 prompt_toolkit（最佳）。
+    未安装时降级为无颜色的标准 input。
+    建议：pip install prompt-toolkit
+    """
+    if _USE_PT:
+        return _pt_prompt(_PT_ANSI(prompt_ansi))
+    # 降级：去掉颜色码，输出纯文本提示符
+    return input(_STRIP_ANSI.sub('', prompt_ansi))
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 会话数据结构
@@ -129,8 +152,8 @@ def clear_server_cache(server: str, session_id: str):
 # 主循环
 # ─────────────────────────────────────────────────────────────────────────────
 
-def print_help():
-    print("""
+def print_help(temp=0.8, topk=50, topp=0.9, maxtok=512):
+    print(f"""
 可用命令：
   /quit               退出程序
   /new                新建对话
@@ -169,7 +192,7 @@ def chat_loop(server: str, default_session_id: str):
         # 提示符
         try:
             prompt_str = f"\033[34mYou\033[0m [{current.title[:18]}]: "
-            user_input = input(prompt_str).strip()
+            user_input = _input(prompt_str).strip()
         except (EOFError, KeyboardInterrupt):
             print("\n再见！")
             break
@@ -184,7 +207,7 @@ def chat_loop(server: str, default_session_id: str):
             break
 
         elif user_input == "/help":
-            print_help().format(temp=temperature, topk=top_k, topp=top_p, maxtok=max_tokens)
+            print_help(temperature, top_k, top_p, max_tokens)
 
         elif user_input == "/new":
             new_id = f"s_{uuid.uuid4().hex[:8]}"

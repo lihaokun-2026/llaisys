@@ -13,6 +13,7 @@ LLAISYS Chat Server — OpenAI-compatible /v1/chat/completions 接口
 import argparse
 import asyncio
 import json
+import re
 import threading
 import time
 import uuid
@@ -46,6 +47,7 @@ class ChatCompletionRequest(BaseModel):
     session_id: Optional[str] = "default"
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 用户会话：独立 KV-Cache + 前缀复用逻辑
 # ─────────────────────────────────────────────────────────────────────────────
@@ -77,9 +79,17 @@ class UserSession:
 
     def _tokenize(self, messages: List[Message]) -> List[int]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
-        prompt = self.tokenizer.apply_chat_template(
-            msgs, add_generation_prompt=True, tokenize=False
-        )
+        try:
+            # Qwen3 思考模型：禁用思考模式，直接生成回答
+            prompt = self.tokenizer.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=False,
+                enable_thinking=False
+            )
+        except TypeError:
+            # 不支持 enable_thinking 参数的 tokenizer（Qwen2/2.5 等）
+            prompt = self.tokenizer.apply_chat_template(
+                msgs, add_generation_prompt=True, tokenize=False
+            )
         return self.tokenizer.encode(prompt)
 
     # ── 核心生成（同步，在推理线程中运行）────────────────────────────────────
@@ -108,8 +118,11 @@ class UserSession:
         if not new_tokens:
             return
 
+        # 简洁实现：skip_special_tokens=True 直接输出干净文本。
+        # 思考模式已在 _tokenize 中通过 enable_thinking=False 禁用（Qwen3），
+        # 无需在此进行额外的 in_think 过滤。
         accumulated_ids: List[int] = []
-        text_so_far = ""
+        text_so_far: str = ""
         generated_ids: List[int] = []
 
         for token_id in self.model_session.stream_generate(
@@ -119,8 +132,8 @@ class UserSession:
             top_p=top_p,
             temperature=temperature,
         ):
-            accumulated_ids.append(token_id)
             generated_ids.append(token_id)
+            accumulated_ids.append(token_id)
 
             new_text = self.tokenizer.decode(
                 accumulated_ids,
@@ -129,7 +142,8 @@ class UserSession:
             )
             delta = new_text[len(text_so_far):]
             text_so_far = new_text
-            yield token_id, delta
+            if delta:
+                yield token_id, delta
 
         # 推理完成后更新前缀缓存
         self.cached_tokens = prompt_tokens + generated_ids
@@ -293,7 +307,12 @@ WEB_UI_HTML = """<!DOCTYPE html>
 <div id="main">
   <div id="header">
     <span id="session-title">对话</span>
-    <span id="model-info">LLAISYS</span>
+    <div style="display:flex;gap:8px;align-items:center">
+      <button onclick="clearCurrentSession()" id="clear-btn"
+        style="font-size:12px;padding:4px 10px;border:1px solid #ddd;border-radius:6px;
+               background:#fff;color:#888;cursor:pointer" title="清空当前会话历史">清空</button>
+      <span id="model-info">LLAISYS</span>
+    </div>
   </div>
 
   <div id="params">
@@ -318,37 +337,73 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
 <script>
 const SERVER = "";
-let sessions = {};          // session_id -> { title, messages[] }
+// session_id  { title, messages[], isGenerating, pendingReply, _bubble }
+let sessions = {};
 let currentSessionId = null;
-let isGenerating = false;
 
-// ── 会话管理 ──────────────────────────────────────────────────────────────────
+//  localStorage 
+function saveSessions() {
+  try {
+    const data = {};
+    for (const [id, s] of Object.entries(sessions))
+      data[id] = { title: s.title, messages: s.messages, isGenerating: false, pendingReply: "" };
+    localStorage.setItem("llaisys_sessions", JSON.stringify(data));
+  } catch {}
+}
+
+//  会话管理 
 function genId() { return "s_" + Math.random().toString(36).slice(2, 10); }
 
 function newSession() {
   const id = genId();
-  sessions[id] = { title: "新对话", messages: [] };
-  switchSession(id);
-  renderSidebar();
-}
-
-function switchSession(id) {
+  sessions[id] = { title: "新对话", messages: [], isGenerating: false, pendingReply: "", _bubble: null };
   currentSessionId = id;
   renderSidebar();
   renderMessages();
-  // 通知服务器清空 KV-Cache（不同会话无法共享缓存）
-  fetch(`${SERVER}/v1/sessions/${id}/clear`, { method: "POST" }).catch(() => {});
+  document.getElementById("send-btn").disabled = false;
+  saveSessions();
+}
+
+function switchSession(id) {
+  if (id === currentSessionId) return;
+  currentSessionId = id;
+  renderSidebar();
+  renderMessages();  // 如该会话正在生成，renderMessages 会重建 _bubble 并显示已生成内容
+  document.getElementById("send-btn").disabled = sessions[id]?.isGenerating || false;
+  // 不再调用 /clear：每个 session_id 在服务器端有独立 KV-Cache，切换不应重置
 }
 
 function deleteSession(id, e) {
   e.stopPropagation();
+  fetch(`${SERVER}/v1/sessions/${id}`, { method: "DELETE" }).catch(() => {});
   delete sessions[id];
   if (currentSessionId === id) {
     const ids = Object.keys(sessions);
-    if (ids.length) switchSession(ids[ids.length - 1]);
-    else newSession();
+    if (ids.length) {
+      currentSessionId = ids[ids.length - 1];
+      renderSidebar();
+      renderMessages();
+      document.getElementById("send-btn").disabled = sessions[currentSessionId]?.isGenerating || false;
+    } else {
+      newSession();
+      return;
+    }
+  } else {
+    renderSidebar();
   }
+  saveSessions();
+}
+
+function clearCurrentSession() {
+  const sess = sessions[currentSessionId];
+  if (!sess || sess.isGenerating) return;
+  sess.messages = [];
+  sess.title = "新对话";
+  sess.pendingReply = "";
+  fetch(`${SERVER}/v1/sessions/${currentSessionId}/clear`, { method: "POST" }).catch(() => {});
   renderSidebar();
+  renderMessages();
+  saveSessions();
 }
 
 function renderSidebar() {
@@ -359,19 +414,27 @@ function renderSidebar() {
     el.className = "session-item" + (id === currentSessionId ? " active" : "");
     el.onclick = () => switchSession(id);
     el.innerHTML = `<span>${s.title.slice(0, 20)}</span>
-      <button class="del-btn" onclick="deleteSession('${id}', event)">×</button>`;
+      <button class="del-btn" onclick="deleteSession('${id}', event)"></button>`;
     list.appendChild(el);
   }
   document.getElementById("session-title").textContent =
     sessions[currentSessionId]?.title || "对话";
 }
 
-// ── 消息渲染 ─────────────────────────────────────────────────────────────────
+//  消息渲染 
 function renderMessages() {
   const container = document.getElementById("messages");
   container.innerHTML = "";
-  const msgs = sessions[currentSessionId]?.messages || [];
-  msgs.forEach((m, i) => appendBubble(m.role, m.content, i));
+  const sess = sessions[currentSessionId];
+  if (!sess) return;
+  sess.messages.forEach((m, i) => appendBubble(m.role, m.content, i));
+  // 如该会话正在生成，重建流式气泡并更新 _bubble 引用
+  // （切换回此会话时可看到已生成的内容）
+  if (sess.isGenerating) {
+    const b = appendBubble("assistant", sess.pendingReply || "");
+    if (!sess.pendingReply) b.innerHTML = '<span class="cursor"></span>';
+    sess._bubble = b;
+  }
   container.scrollTop = container.scrollHeight;
 }
 
@@ -399,21 +462,19 @@ function appendBubble(role, content, idx) {
   return bubble;
 }
 
-// ── 编辑历史消息（重新生成） ──────────────────────────────────────────────────
+//  编辑历史消息（重新生成） 
 function editMessage(idx) {
-  if (isGenerating) return;
+  if (sessions[currentSessionId]?.isGenerating) return;
   const session = sessions[currentSessionId];
-  // 截断到这条 user 消息
   const editedContent = prompt("编辑消息：", session.messages[idx].content);
   if (editedContent === null) return;
   session.messages[idx].content = editedContent;
-  session.messages = session.messages.slice(0, idx + 1); // 删除后续
+  session.messages = session.messages.slice(0, idx + 1);
   renderMessages();
-  // 重新生成 assistant 回复
   doGenerate();
 }
 
-// ── 发送消息 ─────────────────────────────────────────────────────────────────
+//  发送消息 
 function handleKey(e) {
   if (e.key === "Enter" && !e.shiftKey) {
     e.preventDefault();
@@ -422,37 +483,41 @@ function handleKey(e) {
 }
 
 function sendMessage() {
-  if (isGenerating) return;
+  const sess = sessions[currentSessionId];
+  if (!sess || sess.isGenerating) return;
   const input = document.getElementById("user-input");
   const text = input.value.trim();
   if (!text) return;
   input.value = "";
   input.style.height = "auto";
-
-  const session = sessions[currentSessionId];
-  session.messages.push({ role: "user", content: text });
-  if (session.messages.length === 1) {
-    session.title = text.slice(0, 24);
-    renderSidebar();
-  }
-  appendBubble("user", text, session.messages.length - 1);
+  sess.messages.push({ role: "user", content: text });
+  if (sess.messages.length === 1) { sess.title = text.slice(0, 24); renderSidebar(); }
+  appendBubble("user", text, sess.messages.length - 1);
+  saveSessions();
   doGenerate();
 }
 
 async function doGenerate() {
-  if (isGenerating) return;
-  isGenerating = true;
-  document.getElementById("send-btn").disabled = true;
+  const genSessionId = currentSessionId;
+  const session = sessions[genSessionId];
+  if (!session || session.isGenerating) return;
 
-  const session = sessions[currentSessionId];
+  session.isGenerating = true;
+  session.pendingReply = "";
+  // 仅对当前可见会话禁用发送按钮
+  if (currentSessionId === genSessionId)
+    document.getElementById("send-btn").disabled = true;
+
   const temperature = parseFloat(document.getElementById("temperature").value);
   const top_k = parseInt(document.getElementById("top_k").value);
   const top_p = parseFloat(document.getElementById("top_p").value);
   const max_tokens = parseInt(document.getElementById("max_tokens").value);
 
-  // 添加 assistant 气泡（流式填充）
+  // 创建初始气泡并将引用存入 session
+  // （renderMessages 切换会话时会更新 session._bubble 指向新 DOM 元素）
   const bubble = appendBubble("assistant", "");
   bubble.innerHTML = '<span class="cursor"></span>';
+  session._bubble = bubble;
   let reply = "";
 
   try {
@@ -464,15 +529,15 @@ async function doGenerate() {
         messages: session.messages,
         temperature, top_k, top_p, max_tokens,
         stream: true,
-        session_id: currentSessionId,
+        session_id: genSessionId,
       }),
     });
 
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
-    let buf = "";
+    let buf = "", streamDone = false;
 
-    while (true) {
+    while (!streamDone) {
       const { value, done } = await reader.read();
       if (done) break;
       buf += decoder.decode(value, { stream: true });
@@ -481,27 +546,63 @@ async function doGenerate() {
       for (const line of lines) {
         if (!line.startsWith("data: ")) continue;
         const payload = line.slice(6).trim();
-        if (payload === "[DONE]") break;
+        if (payload === "[DONE]") { streamDone = true; break; }
         try {
-          const chunk = JSON.parse(payload);
-          const delta = chunk.choices?.[0]?.delta?.content || "";
+          const delta = JSON.parse(payload).choices?.[0]?.delta?.content || "";
+          if (!delta) continue;
           reply += delta;
-          bubble.textContent = reply;
-          document.getElementById("messages").scrollTop = 99999;
+          session.pendingReply = reply;
+          // session._bubble 可能被 renderMessages 更新为新 DOM 元素，始终用最新引用
+          if (session._bubble && document.body.contains(session._bubble)) {
+            session._bubble.textContent = reply;
+            document.getElementById("messages").scrollTop = 99999;
+          }
         } catch {}
       }
     }
+    reader.cancel().catch(() => {});
   } catch (err) {
-    bubble.textContent = `[错误: ${err.message}]`;
+    reply = reply || `[错误: ${err.message}]`;
+    if (session._bubble && document.body.contains(session._bubble))
+      session._bubble.textContent = reply;
+  } finally {
+    session.pendingReply = "";
+    session._bubble = null;
+    session.isGenerating = false;
+    session.messages.push({ role: "assistant", content: reply || "[无回复]" });
+    saveSessions();
+    // 如果用户当前在此会话，重新渲染消息并恢复按钮
+    if (currentSessionId === genSessionId) {
+      renderMessages();
+      document.getElementById("send-btn").disabled = false;
+    }
   }
-
-  session.messages.push({ role: "assistant", content: reply });
-  isGenerating = false;
-  document.getElementById("send-btn").disabled = false;
 }
 
-// ── 初始化 ────────────────────────────────────────────────────────────────────
-newSession();
+//  初始化 
+(function() {
+  try {
+    const saved = localStorage.getItem("llaisys_sessions");
+    if (saved) {
+      const data = JSON.parse(saved);
+      const ids = Object.keys(data || {});
+      if (ids.length > 0) {
+        sessions = data;
+        for (const s of Object.values(sessions)) {
+          s.isGenerating = false;
+          s.pendingReply = "";
+          s._bubble = null;
+        }
+        currentSessionId = ids[ids.length - 1];
+        renderSidebar();
+        renderMessages();
+        document.getElementById("send-btn").disabled = false;
+        return;
+      }
+    }
+  } catch {}
+  newSession();
+})();
 </script>
 </body>
 </html>
