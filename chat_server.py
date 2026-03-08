@@ -125,9 +125,11 @@ class UserSession:
 
             new_text = self.tokenizer.decode(
                 accumulated_ids,
-                skip_special_tokens=True,
+                skip_special_tokens=False,  # 保留 <think>...</think> 标签（DeepSeek/Qwen3 思考模型）
                 clean_up_tokenization_spaces=False,
             )
+            # 过滤 <|end_of_sentence|> <|im_end|> 等特殊 token，保留 <think> / </think>
+            new_text = re.sub(r"<\|[^>]*\|>", "", new_text)
             delta = new_text[len(text_so_far):]
             text_so_far = new_text
             if delta:
