@@ -15,41 +15,26 @@ import gradio as gr
 import requests
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 特殊 token 过滤（Qwen / DeepSeek / ChatML 等模型）
+# 工具函数
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 匹配 <|end_of_sentence|>  <|im_end|>  <|endoftext|> 等各类特殊 token
-_SPECIAL_RE = re.compile(r"<\|[^|>]*\|>", re.IGNORECASE)
+# 匹配 <|token|> / <｜token｜>（含全角竖线 U+FF5C、SentencePiece ▁ U+2581、空格变体）
+_SPECIAL_RE = re.compile(r"<[\s|｜]*[^<>]*[|｜][^<>]*>", re.IGNORECASE | re.UNICODE)
 
 def _clean(text: str) -> str:
-    """移除特殊 token，去掉首尾空白。"""
     return _SPECIAL_RE.sub("", text).strip()
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# think 标签规范化
-# ─────────────────────────────────────────────────────────────────────────────
-
 def _normalize_think(text: str) -> str:
-    """
-    若仅有 </think> 而无 <think>（<think> 被 tokenizer 作为 special token 跳过），
-    在最前面补上 <think>，使 Gradio reasoning_tags 能正确渲染。
-    """
+    """若仅有 </think> 无 <think>，补上开标签，供 reasoning_tags 渲染。"""
     if "</think>" in text and "<think>" not in text:
         return "<think>" + text
     return text
 
-
 def _strip_think(text: str) -> str:
-    """去掉思考块，仅保留最终回答（构建多轮 API 上下文时使用）。"""
+    """多轮对话时，assistant 消息去掉思考块，只保留最终回答。"""
     t = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL)
     t = re.sub(r"<think>.*$",         "", t,    flags=re.DOTALL)
     return _clean(t)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# API 消息构建
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _build_api_messages(history: list) -> list:
     msgs = []
@@ -64,165 +49,234 @@ def _build_api_messages(history: list) -> list:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS
+# CSS — 豆包风格：白底卡片、极简线条、绿色点缀
 # ─────────────────────────────────────────────────────────────────────────────
 
 CSS = """
-/* === 全局 ================================================================ */
+/* ===== 全局 ===== */
+html, body { background: #f2f3f5 !important; }
 .gradio-container {
-    max-width: 1280px !important;
-    margin: 0 auto !important;
-    padding: 16px 20px !important;
-}
-
-/* === 标题渐变卡片 ========================================================= */
-#llaisys-header {
-    background: linear-gradient(120deg, #0d9488 0%, #0e7490 55%, #1e40af 100%);
-    border-radius: 16px !important;
-    padding: 22px 28px !important;
-    margin-bottom: 14px !important;
-    box-shadow: 0 6px 30px rgba(13, 148, 136, 0.28) !important;
-}
-#llaisys-header h1 {
-    color: #ffffff !important;
-    font-size: 1.65rem !important;
-    font-weight: 700 !important;
-    margin: 0 0 5px 0 !important;
-    letter-spacing: -0.4px !important;
-    line-height: 1.2 !important;
-}
-#llaisys-header p {
-    color: rgba(255, 255, 255, 0.75) !important;
-    font-size: 0.84rem !important;
-    margin: 0 !important;
-}
-
-/* === 聊天列容器 =========================================================== */
-#chat-col {
-    background: #ffffff !important;
-    border: 1px solid #e2e8f0 !important;
-    border-radius: 16px !important;
-    overflow: hidden !important;
-    box-shadow: 0 2px 18px rgba(0, 0, 0, 0.07) !important;
+    max-width: 100% !important;
     padding: 0 !important;
+    background: #f2f3f5 !important;
+    font-family: -apple-system, 'PingFang SC', 'Microsoft YaHei', 'Segoe UI', sans-serif !important;
+}
+.main { padding: 0 !important; }
+footer { display: none !important; }
+
+/* ===== 顶部导航栏 ===== */
+#top-bar {
+    background: #ffffff;
+    border-bottom: 1px solid #e8e8e8;
+    padding: 0 28px;
+    height: 58px;
+    display: flex !important;
+    align-items: center;
+    gap: 0;
+    margin-bottom: 0 !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.05);
+}
+#top-bar .gr-markdown, #top-bar > div { margin: 0 !important; padding: 0 !important; }
+#top-bar p { margin: 0 !important; font-size: 16px; }
+
+/* ===== 内容布局 ===== */
+#content-wrap {
+    max-width: 1380px;
+    margin: 16px auto !important;
+    padding: 0 16px;
+    gap: 14px !important;
+    align-items: flex-start !important;
 }
 
-/* === 气泡圆角 ============================================================= */
-.message-bubble-border { border-radius: 14px !important; }
-
-/* === 输入区底部背景 ======================================================= */
-#input-area {
-    background: #f8fafc !important;
-    border-top: 1px solid #e8edf4 !important;
-    padding: 10px 14px 6px 14px !important;
-}
-#action-row {
-    background: #f8fafc !important;
-    padding: 4px 14px 12px 14px !important;
-}
-
-/* === 文本输入框 =========================================================== */
-#msg-input textarea {
-    border-radius: 10px !important;
-    border: 1.5px solid #cbd5e1 !important;
+/* ===== 聊天卡片 ===== */
+#chat-card {
     background: #ffffff !important;
-    font-size: 0.95rem !important;
-    line-height: 1.55 !important;
+    border: 1px solid #e8eaed !important;
+    border-radius: 14px !important;
+    overflow: hidden !important;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.07) !important;
+    padding: 0 !important;
+    gap: 0 !important;
+}
+
+/* Chatbot 本体 */
+#chatbot-box {
+    border: none !important;
+    box-shadow: none !important;
+    background: #fafbfc !important;
+}
+
+/* 消息区域内边距 */
+#chatbot-box .message-wrap { padding: 4px 20px !important; }
+
+/* 用户气泡 */
+#chatbot-box .message.user .bubble-wrap,
+#chatbot-box .user .bubble-wrap {
+    background: #edfbf4 !important;
+    border: 1px solid #c6f0dc !important;
+    border-radius: 14px 14px 4px 14px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04) !important;
+}
+/* AI 气泡 */
+#chatbot-box .message.bot .bubble-wrap,
+#chatbot-box .message.assistant .bubble-wrap,
+#chatbot-box .bot .bubble-wrap {
+    background: #ffffff !important;
+    border: 1px solid #ebebeb !important;
+    border-radius: 14px 14px 14px 4px !important;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.04) !important;
+}
+
+/* ===== 输入区 ===== */
+#input-area {
+    border-top: 1px solid #f0f0f0 !important;
+    background: #ffffff !important;
+    padding: 12px 16px 8px !important;
+    margin: 0 !important;
+    gap: 10px !important;
+}
+
+/* 文本框 */
+#msg-input { margin: 0 !important; }
+#msg-input textarea {
+    border: 1.5px solid #dde1e7 !important;
+    border-radius: 12px !important;
+    background: #fafafa !important;
+    font-size: 14px !important;
+    line-height: 1.6 !important;
     padding: 10px 14px !important;
-    transition: border-color 0.2s ease, box-shadow 0.2s ease !important;
+    color: #1a1a1a !important;
+    transition: border-color 0.18s, box-shadow 0.18s !important;
     resize: none !important;
 }
 #msg-input textarea:focus {
-    border-color: #0d9488 !important;
-    box-shadow: 0 0 0 3px rgba(13, 148, 136, 0.13) !important;
+    border-color: #09b37b !important;
+    background: #fff !important;
+    box-shadow: 0 0 0 3px rgba(9,179,123,0.10) !important;
     outline: none !important;
 }
+#msg-input textarea::placeholder { color: #b0b7c0 !important; }
 
-/* === 发送按钮 ============================================================= */
+/* 发送按钮 */
+#send-btn { margin: 0 !important; }
 #send-btn button {
-    background: linear-gradient(135deg, #0d9488 0%, #0891b2 100%) !important;
+    background: #09b37b !important;
     border: none !important;
-    border-radius: 10px !important;
+    border-radius: 11px !important;
     color: #fff !important;
+    font-size: 14px !important;
     font-weight: 600 !important;
-    font-size: 0.9rem !important;
-    letter-spacing: 0.3px !important;
-    box-shadow: 0 3px 10px rgba(13, 148, 136, 0.30) !important;
-    transition: transform 0.16s ease, box-shadow 0.16s ease !important;
+    min-height: 50px !important;
+    box-shadow: 0 2px 8px rgba(9,179,123,0.30) !important;
+    transition: background 0.15s, box-shadow 0.15s, transform 0.12s !important;
 }
 #send-btn button:hover {
+    background: #07a06e !important;
+    box-shadow: 0 5px 18px rgba(9,179,123,0.40) !important;
     transform: translateY(-1px) !important;
-    box-shadow: 0 6px 18px rgba(13, 148, 136, 0.42) !important;
 }
 #send-btn button:active { transform: translateY(0) !important; }
 
-/* === 清空 / 新对话按钮 ==================================================== */
-#clear-btn button {
-    border-radius: 8px !important;
-    border: 1.5px solid #e2e8f0 !important;
+/* 底部按钮行 */
+#action-row {
+    background: #ffffff !important;
+    padding: 4px 16px 14px !important;
+    margin: 0 !important;
+    gap: 10px !important;
+}
+#clear-btn button, #new-btn button {
     background: #fff !important;
-    color: #64748b !important;
-    font-size: 0.84rem !important;
-    transition: border-color 0.14s, color 0.14s, background 0.14s !important;
+    border: 1px solid #e2e6ea !important;
+    border-radius: 8px !important;
+    color: #6b7280 !important;
+    font-size: 13px !important;
+    height: 34px !important;
+    transition: all 0.15s !important;
 }
 #clear-btn button:hover {
     border-color: #fca5a5 !important;
     color: #dc2626 !important;
-    background: #fff5f5 !important;
-}
-#new-btn button {
-    border-radius: 8px !important;
-    border: 1.5px solid #e2e8f0 !important;
-    background: #fff !important;
-    color: #64748b !important;
-    font-size: 0.84rem !important;
-    transition: border-color 0.14s, color 0.14s, background 0.14s !important;
+    background: #fff8f8 !important;
 }
 #new-btn button:hover {
-    border-color: #5eead4 !important;
-    color: #0d9488 !important;
-    background: #f0fdfa !important;
+    border-color: #6ee7b7 !important;
+    color: #059669 !important;
+    background: #f0fdf7 !important;
 }
 
-/* === 参数面板 ============================================================= */
-#param-panel {
+/* ===== 参数面板 ===== */
+#param-card {
     background: #ffffff !important;
-    border: 1px solid #e2e8f0 !important;
-    border-radius: 16px !important;
-    padding: 18px 16px !important;
-    box-shadow: 0 2px 18px rgba(0, 0, 0, 0.07) !important;
+    border: 1px solid #e8eaed !important;
+    border-radius: 14px !important;
+    padding: 20px 18px !important;
+    box-shadow: 0 2px 16px rgba(0,0,0,0.07) !important;
+    gap: 10px !important;
+}
+#param-card label span {
+    font-size: 13px !important;
+    color: #374151 !important;
+    font-weight: 500 !important;
 }
 
-/* === Gradio 6 内置 Reasoning 块（思考块）==================================== */
-/* 正在思考中（展开）*/
-.thinking[open],
+/* ===== Reasoning 思考块 ===== */
 .thinking {
-    background: linear-gradient(135deg, #f0fdf9 0%, #ecfeff 100%) !important;
+    background: linear-gradient(135deg, #f0fdf8 0%, #ecfdf5 100%) !important;
     border: 1px solid #a7f3d0 !important;
-    border-left: 3px solid #0d9488 !important;
+    border-left: 3px solid #09b37b !important;
     border-radius: 10px !important;
-    margin: 4px 0 8px 0 !important;
-    overflow: hidden !important;
+    margin: 6px 0 10px !important;
     font-size: 13px !important;
+    overflow: hidden !important;
 }
-/* summary 行 */
 .thinking > summary {
-    padding: 8px 12px !important;
-    color: #0f766e !important;
+    padding: 9px 13px !important;
+    color: #065f46 !important;
     font-weight: 500 !important;
     cursor: pointer !important;
-    user-select: none !important;
     list-style: none !important;
-    background: rgba(13, 148, 136, 0.06) !important;
+    user-select: none !important;
+    background: rgba(9,179,123,0.05) !important;
+    display: flex !important;
+    align-items: center !important;
+    gap: 6px !important;
 }
-.thinking > summary:hover { background: rgba(13, 148, 136, 0.10) !important; }
-/* 内容区 */
-.thinking > div,
-.thinking > p {
-    padding: 8px 12px 10px !important;
-    color: #134e4a !important;
-    line-height: 1.65 !important;
-    border-top: 1px solid #ccfbf1 !important;
+.thinking > summary::marker,
+.thinking > summary::-webkit-details-marker { display: none !important; }
+.thinking > summary:hover { background: rgba(9,179,123,0.10) !important; }
+.thinking > summary::before {
+    content: "▶" !important;
+    font-size: 10px !important;
+    color: #09b37b !important;
+    transition: transform 0.2s !important;
+    display: inline-block !important;
+}
+.thinking[open] > summary::before { transform: rotate(90deg) !important; }
+.thinking > div, .thinking > p {
+    padding: 8px 14px 11px !important;
+    color: #1a3a2e !important;
+    line-height: 1.7 !important;
+    border-top: 1px solid #bbf7d0 !important;
+}
+
+/* ===== 代码块美化 ===== */
+code, pre {
+    font-family: 'JetBrains Mono', 'Fira Code', Consolas, 'Courier New', monospace !important;
+}
+pre {
+    background: #1e2433 !important;
+    border-radius: 8px !important;
+    padding: 14px 16px !important;
+    overflow-x: auto !important;
+    border: none !important;
+}
+pre code { color: #e2e8f0 !important; font-size: 13px !important; line-height: 1.6 !important; }
+:not(pre) > code {
+    background: #f1f4f8 !important;
+    color: #d63384 !important;
+    border-radius: 4px !important;
+    padding: 2px 5px !important;
+    font-size: 13px !important;
 }
 """
 
@@ -231,17 +285,8 @@ CSS = """
 # 流式生成
 # ─────────────────────────────────────────────────────────────────────────────
 
-def respond(
-    user_msg: str,
-    history: list,
-    session_id: str,
-    server_url: str,
-    temperature: float,
-    top_k: int,
-    top_p: float,
-    max_tokens: int,
-):
-    """流式生成器：每收到增量 token 就 yield 更新后的 history。"""
+def respond(user_msg, history, session_id, server_url,
+            temperature, top_k, top_p, max_tokens):
     if not user_msg.strip():
         yield history, ""
         return
@@ -268,8 +313,7 @@ def respond(
                 "stream":      True,
                 "session_id":  session_id,
             },
-            stream=True,
-            timeout=300,
+            stream=True, timeout=300,
         ) as resp:
             resp.raise_for_status()
             for line in resp.iter_lines():
@@ -285,12 +329,10 @@ def respond(
                     delta = json.loads(payload)["choices"][0]["delta"].get("content", "")
                     if delta:
                         full_text += delta
-                        # 过滤特殊 token，规范 think 标签
                         history[-1]["content"] = _normalize_think(_clean(full_text))
                         yield history, ""
                 except Exception:
                     pass
-
     except Exception as exc:
         history[-1]["content"] = f"❌ 连接错误：{exc}"
         yield history, ""
@@ -300,7 +342,7 @@ def respond(
     yield history, ""
 
 
-def do_clear(session_id: str, server_url: str):
+def do_clear(session_id, server_url):
     try:
         requests.post(f"{server_url}/v1/sessions/{session_id}/clear", timeout=5)
     except Exception:
@@ -313,7 +355,7 @@ def do_new_session():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Gradio UI
+# UI 构建
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_ui(server_url: str) -> gr.Blocks:
@@ -322,40 +364,41 @@ def build_ui(server_url: str) -> gr.Blocks:
         session_id_st = gr.State(str(uuid.uuid4()))
         server_url_st = gr.State(server_url)
 
-        # ── 标题卡片 ────────────────────────────────────────────────────────
-        gr.Markdown(
-            "# 🤖 LLAISYS Chat\n\n"
-            "高性能 LLM 推理框架 · 支持实时推理过程展示",
-            elem_id="llaisys-header",
-        )
+        # ── 顶部导航栏 ──────────────────────────────────────────────────────
+        with gr.Row(elem_id="top-bar"):
+            gr.Markdown(
+                "🤖 &nbsp;**LLAISYS Chat**"
+                "&ensp;<span style='color:#9ca3af;font-weight:400;font-size:13px'>"
+                "高性能 LLM 推理框架</span>"
+            )
 
-        with gr.Row(equal_height=False):
+        # ── 主体内容 ────────────────────────────────────────────────────────
+        with gr.Row(equal_height=False, elem_id="content-wrap"):
 
             # ── 聊天列 ──────────────────────────────────────────────────────
-            with gr.Column(scale=5, elem_id="chat-col"):
+            with gr.Column(scale=5, elem_id="chat-card"):
                 chatbot = gr.Chatbot(
-                    elem_id="chatbot",
-                    height=530,
+                    elem_id="chatbot-box",
+                    height=545,
                     show_label=False,
                     render_markdown=True,
                     sanitize_html=False,
-                    # Gradio 6 内置：将 <think>…</think> 渲染为可折叠 Reasoning 块
                     reasoning_tags=[("<think>", "</think>")],
                     placeholder=(
-                        "<div style='text-align:center;padding:70px 0 40px;'>"
-                        "<div style='font-size:3rem;margin-bottom:12px'>💬</div>"
-                        "<h4 style='color:#475569;font-weight:500;margin:0 0 8px'>"
-                        "向 AI 提问吧</h4>"
-                        "<p style='color:#94a3b8;font-size:13px;margin:0'>"
-                        "模型的推理过程将以可折叠的思考块呈现</p>"
+                        "<div style='text-align:center;padding:90px 20px 40px;'>"
+                        "<div style='font-size:52px;margin-bottom:16px;opacity:.5'>✦</div>"
+                        "<p style='color:#4b5563;font-size:16px;font-weight:500;margin:0 0 8px'>"
+                        "有什么可以帮助你？</p>"
+                        "<p style='color:#9ca3af;font-size:13px;margin:0'>"
+                        "推理过程将以可折叠的思考块展示</p>"
                         "</div>"
                     ),
                 )
 
-                # 输入区
+                # 输入行
                 with gr.Row(elem_id="input-area"):
                     msg_box = gr.Textbox(
-                        placeholder="输入消息… Enter 发送 / Shift+Enter 换行",
+                        placeholder="发消息给 LLAISYS… （Enter 发送，Shift+Enter 换行）",
                         show_label=False,
                         lines=2,
                         max_lines=8,
@@ -365,36 +408,25 @@ def build_ui(server_url: str) -> gr.Blocks:
                         elem_id="msg-input",
                     )
                     send_btn = gr.Button(
-                        "发送 ▶",
+                        "发 送",
                         variant="primary",
                         scale=1,
-                        min_width=90,
+                        min_width=88,
                         elem_id="send-btn",
                     )
 
                 # 操作按钮行
                 with gr.Row(elem_id="action-row"):
-                    clear_btn = gr.Button(
-                        "🗑  清空对话",
-                        size="sm",
-                        variant="secondary",
-                        elem_id="clear-btn",
-                    )
-                    new_btn = gr.Button(
-                        "➕  新对话",
-                        size="sm",
-                        variant="secondary",
-                        elem_id="new-btn",
-                    )
+                    clear_btn = gr.Button("🗑  清空对话", size="sm", elem_id="clear-btn")
+                    new_btn   = gr.Button("✦  新对话",   size="sm", elem_id="new-btn")
 
             # ── 参数面板 ────────────────────────────────────────────────────
-            with gr.Column(scale=1, min_width=230, elem_id="param-panel"):
+            with gr.Column(scale=1, min_width=248, elem_id="param-card"):
                 gr.Markdown("### ⚙️  生成参数")
-
                 temperature = gr.Slider(
                     minimum=0.0, maximum=2.0, value=0.7, step=0.05,
-                    label="温度 (Temperature)",
-                    info="越高越随机，越低越保守",
+                    label="温度 Temperature",
+                    info="↑ 更随机 · ↓ 更保守",
                 )
                 top_k = gr.Slider(
                     minimum=1, maximum=200, value=50, step=1,
@@ -402,21 +434,19 @@ def build_ui(server_url: str) -> gr.Blocks:
                 )
                 top_p = gr.Slider(
                     minimum=0.0, maximum=1.0, value=0.9, step=0.05,
-                    label="Top-P (核采样)",
+                    label="Top-P  核采样",
                 )
                 max_tokens = gr.Slider(
                     minimum=64, maximum=4096, value=1024, step=64,
                     label="最大 Token 数",
                 )
-
                 gr.Markdown(
-                    "<hr style='border-color:#e2e8f0;margin:14px 0'/>\n\n"
+                    "<hr style='border-color:#f0f0f0;margin:14px 0'/>\n\n"
                     "### 💭  思考块\n\n"
-                    "模型的推理过程自动渲染为\n"
-                    "**可折叠的 Reasoning 块**，\n"
-                    "点击即可展开 / 收起。\n\n"
-                    "适用于 **DeepSeek-R1**、\n"
-                    "**Qwen3** 等推理模型。"
+                    "点击 **Reasoning** 折叠块\n"
+                    "展开 / 收起推理过程。\n\n"
+                    "适用于 DeepSeek-R1、\n"
+                    "Qwen3 等推理模型。"
                 )
 
         # ── 事件绑定 ────────────────────────────────────────────────────────
@@ -446,15 +476,14 @@ def build_ui(server_url: str) -> gr.Blocks:
 
 def main():
     parser = argparse.ArgumentParser(description="LLAISYS Chat UI (Gradio 6)")
-    parser.add_argument("--server", default="http://localhost:8000",
-                        help="FastAPI 后端地址（chat_server.py）")
-    parser.add_argument("--host",   default="0.0.0.0",  help="监听地址")
-    parser.add_argument("--port",   type=int, default=7860, help="监听端口")
-    parser.add_argument("--share",  action="store_true",  help="生成 Gradio 公共链接")
+    parser.add_argument("--server", default="http://localhost:8000")
+    parser.add_argument("--host",   default="0.0.0.0")
+    parser.add_argument("--port",   type=int, default=7860)
+    parser.add_argument("--share",  action="store_true")
     args = parser.parse_args()
 
-    print(f"[ui] 连接后端: {args.server}")
-    print(f"[ui] Gradio UI: http://localhost:{args.port}")
+    print(f"[ui] 后端: {args.server}")
+    print(f"[ui] 界面: http://localhost:{args.port}")
     demo = build_ui(args.server)
     demo.queue()
     demo.launch(
@@ -462,9 +491,9 @@ def main():
         server_port=args.port,
         share=args.share,
         theme=gr.themes.Soft(
-            primary_hue="teal",
-            secondary_hue="cyan",
-            neutral_hue="slate",
+            primary_hue=gr.themes.colors.emerald,
+            secondary_hue=gr.themes.colors.teal,
+            neutral_hue=gr.themes.colors.gray,
         ),
         css=CSS,
     )

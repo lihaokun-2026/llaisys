@@ -128,8 +128,8 @@ class UserSession:
                 skip_special_tokens=False,  # 保留 <think>...</think> 标签（DeepSeek/Qwen3 思考模型）
                 clean_up_tokenization_spaces=False,
             )
-            # 过滤 <|end_of_sentence|> <|im_end|> 等特殊 token，保留 <think> / </think>
-            new_text = re.sub(r"<\|[^>]*\|>", "", new_text)
+            # 过滤 <|token|> / <｜token｜>（含全角竖线 U+FF5C / SentencePiece ▁ U+2581 变体）
+            new_text = re.sub(r"<[\s|｜]*[^<>]*[|｜][^<>]*>", "", new_text)
             delta = new_text[len(text_so_far):]
             text_so_far = new_text
             if delta:
