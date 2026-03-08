@@ -37,8 +37,6 @@ class Qwen2Session:
             raise RuntimeError("llaisysQwen2SessionCreate returned null")
         self._meta = model._meta
         self._device = model._device
-        # 前缀复用：记录当前 KV-Cache 对应的完整 token 序列
-        self._cached_tokens: list = []
 
     # ── 基础属性 ────────────────────────────────────────────────────────────
 
@@ -52,7 +50,6 @@ class Qwen2Session:
 
     def reset_cache(self):
         LIB_LLAISYS.llaisysQwen2SessionResetCache(self._sess)
-        self._cached_tokens = []
 
     # ── 推理 ─────────────────────────────────────────────────────────────────
 

@@ -3,11 +3,17 @@
 #include "../../core/llaisys_core.hpp"
 #include "../../utils.hpp"
 
+#include "cpu/flash_attention_cpu.hpp"
 #include "cpu/self_attention_cpu.hpp"
 
 #ifdef ENABLE_NVIDIA_API
+#include "nvidia/flash_attention_cuda.cuh"
 #include "nvidia/self_attention_cuda.cuh"
 #endif
+
+// 定义此宏以启用 Flash Attention 2 后端
+// 对序列较长时内存占用和速度均有提升
+#define USE_FLASH_ATTENTION
 
 namespace llaisys::ops {
 void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float scale) {
@@ -55,13 +61,25 @@ void self_attention(tensor_t attn_val, tensor_t q, tensor_t k, tensor_t v, float
 
     switch (attn_val->deviceType()) {
     case LLAISYS_DEVICE_CPU:
+#ifdef USE_FLASH_ATTENTION
+        return cpu::flash_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                    attn_val->dtype(), seq_len, total_len,
+                                    n_heads, n_kv_heads, v_head_dim, scale);
+#else
         return cpu::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
                                    attn_val->dtype(), seq_len, total_len, n_heads, n_kv_heads, v_head_dim, scale);
+#endif
 #ifdef ENABLE_NVIDIA_API
     case LLAISYS_DEVICE_NVIDIA:
+#ifdef USE_FLASH_ATTENTION
+        return nvidia::flash_attention(attn_val->data(), q->data(), k->data(), v->data(),
+                                       attn_val->dtype(), seq_len, total_len,
+                                       n_heads, n_kv_heads, v_head_dim, scale);
+#else
         return nvidia::self_attention(attn_val->data(), q->data(), k->data(), v->data(),
                                       attn_val->dtype(), seq_len, total_len,
                                       n_heads, n_kv_heads, v_head_dim, scale);
+#endif
 #endif
     default:
         EXCEPTION_UNSUPPORTED_DEVICE;

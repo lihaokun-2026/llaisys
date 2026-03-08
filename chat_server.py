@@ -58,24 +58,15 @@ class UserSession:
 
     - model_session : Qwen2Session，拥有独立 KV-Cache（隔离于其他用户）
     - lock          : asyncio.Lock，同一会话同一时刻只允许一个推理请求
-    - cached_tokens : 当前 KV-Cache 对应的完整 token 序列，用于前缀复用
     """
 
     def __init__(self, model_session, tokenizer):
         self.model_session = model_session  # Qwen2Session
         self.tokenizer = tokenizer
         self.lock = asyncio.Lock()
-        self.cached_tokens: List[int] = []
 
     # ── 辅助 ──────────────────────────────────────────────────────────────────
 
-    @staticmethod
-    def _common_prefix_len(a: List[int], b: List[int]) -> int:
-        n = min(len(a), len(b))
-        for i in range(n):
-            if a[i] != b[i]:
-                return i
-        return n
 
     def _tokenize(self, messages: List[Message]) -> List[int]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
@@ -108,13 +99,10 @@ class UserSession:
         在独立 OS 线程中调用；thread_local CUDA Context 确保并发隔离。
         """
         prompt_tokens = self._tokenize(messages)
-        prefix_len = self._common_prefix_len(self.cached_tokens, prompt_tokens)
 
-        # KV-Cache 前缀复用：回退到公共前缀末尾
-        if prefix_len < len(self.cached_tokens):
-            self.model_session.cache_pos = prefix_len
-
-        new_tokens = prompt_tokens[prefix_len:]
+        # 每次推理前重置 KV-Cache，直接传入完整 prompt
+        self.model_session.reset_cache()
+        new_tokens = prompt_tokens
         if not new_tokens:
             return
 
@@ -145,13 +133,9 @@ class UserSession:
             if delta:
                 yield token_id, delta
 
-        # 推理完成后更新前缀缓存
-        self.cached_tokens = prompt_tokens + generated_ids
-
     def clear(self):
-        """清空 KV-Cache，重置前缀缓存。"""
+        """清空 KV-Cache。"""
         self.model_session.reset_cache()
-        self.cached_tokens = []
 
 
 # ─────────────────────────────────────────────────────────────────────────────

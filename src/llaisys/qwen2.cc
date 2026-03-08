@@ -7,8 +7,10 @@
 #include <cmath>
 #include <cstring>
 #include <memory>
+#include <mutex>
 #include <numeric>
 #include <random>
+#include <unordered_map>
 #include <vector>
 
 namespace llaisys {
@@ -68,7 +70,9 @@ struct Qwen2Session {
         }
     }
 
-    void reset() { cache_pos = 0; }
+    void reset() {
+        cache_pos = 0;
+    }
     void set_pos(size_t pos) { cache_pos = pos; }
     size_t get_pos() const { return cache_pos; }
 };
@@ -254,6 +258,7 @@ struct Qwen2Model {
 
         // 更新 cache 位置并返回设备端 logits
         sess.cache_pos += seq_len;
+
         return logits->view({meta.voc});
     }
 
