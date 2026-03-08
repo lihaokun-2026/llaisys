@@ -12,14 +12,19 @@ LLAISYS Chat Server — OpenAI-compatible /v1/chat/completions 接口
 
 import argparse
 import asyncio
+import concurrent.futures
+import hashlib
 import json
+import queue
 import re
 import threading
 import time
 import uuid
 import sys
 import os
-from typing import AsyncIterator, Dict, List, Optional, Iterator
+from collections import OrderedDict
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Dict, List, Optional, Iterator, Set, Tuple
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
@@ -54,128 +59,599 @@ class ChatCompletionRequest(BaseModel):
 
 class UserSession:
     """
-    一个用户的完整会话状态。
-
-    - model_session : Qwen2Session，拥有独立 KV-Cache（隔离于其他用户）
-    - lock          : asyncio.Lock，同一会话同一时刻只允许一个推理请求
+    轻量级会话标识，不持有 KV-Cache（由 KVCachePool 统一管理）。
+    职责：分词 + asyncio.Lock 确保同一 session_id 的请求串行提交给调度器。
     """
 
-    def __init__(self, model_session, tokenizer):
-        self.model_session = model_session  # Qwen2Session
+    def __init__(self, session_id: str, tokenizer):
+        self.session_id = session_id
         self.tokenizer = tokenizer
         self.lock = asyncio.Lock()
-
-    # ── 辅助 ──────────────────────────────────────────────────────────────────
-
 
     def _tokenize(self, messages: List[Message]) -> List[int]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
         try:
-            # Qwen3 思考模型：禁用思考模式，直接生成回答
             prompt = self.tokenizer.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False,
                 enable_thinking=False
             )
         except TypeError:
-            # 不支持 enable_thinking 参数的 tokenizer（Qwen2/2.5 等）
             prompt = self.tokenizer.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False
             )
         return self.tokenizer.encode(prompt)
 
-    # ── 核心生成（同步，在推理线程中运行）────────────────────────────────────
 
-    def _stream_tokens_sync(
+# ─────────────────────────────────────────────────────────────────────────────
+# KV-Cache Pool：块哈希前缀匹配 + LRU 淘汰
+# ─────────────────────────────────────────────────────────────────────────────
+
+BLOCK_SIZE: int = 16          # 每块 token 数（只缓存/匹配「完整 block」）
+_ROOT_HASH: bytes = b'\x00' * 8  # 哈希链起始节点
+
+
+def _block_hash(parent_hash: bytes, block_tokens: List[int], extra: bytes = b"") -> bytes:
+    """
+    计算单个 KV block 的哈希 key:
+        key = H(parent_hash || len(block_tokens) || block_tokens || extra)
+
+    带入 parent_hash 保证不同前缀下相同 block token 不会误命中:
+        Prompt A: [X Y][P Q]   vs   Prompt B: [M N][P Q]
+        第二块 token 相同，但 parent_hash 不同 → key 不同 → 不会错复用
+    """
+    h = hashlib.sha256()
+    h.update(parent_hash)
+    h.update(len(block_tokens).to_bytes(4, "little"))
+    for t in block_tokens:
+        h.update(t.to_bytes(8, "little"))
+    h.update(extra)
+    return h.digest()[:8]   # 64-bit，碰撞概率 < 2^{-64}
+
+
+@dataclass
+class KVCacheEntry:
+    """
+    池中的一个物理 KV 状态条目，封装一个 Qwen2Session。
+
+    Fields:
+        entry_id      : 池内唯一 ID
+        model_session : Qwen2Session（持有 GPU/CPU KV tensor，shape {maxseq, nkvh, dh}）
+        cached_tokens : model_session KV buffer 中已正确计算的完整 token 序列
+        block_hashes  : 对应 cached_tokens 的完整 block 哈希链
+                        block_hashes[i] = H(block_hashes[i-1], cached_tokens[i*BS:(i+1)*BS])
+        ref_cnt       : 借出引用计数（> 0 时不可淘汰，不可被他人借用）
+        last_access   : 最近使用时刻（LRU 依据，单调时钟）
+        owner_sid     : 最近持有该 entry 的 session_id（同 session 优先复用）
+    """
+    entry_id: int
+    model_session: object
+    cached_tokens: List[int] = field(default_factory=list)
+    block_hashes: List[bytes] = field(default_factory=list)
+    ref_cnt: int = 0
+    last_access: float = field(default_factory=time.monotonic)
+    owner_sid: str = ""
+
+
+class KVCachePool:
+    """
+    跨会话 KV-Cache 前缀匹配池（仿 vLLM block cache 思路）。
+
+    核心数据结构:
+        _entries     : Dict[entry_id, KVCacheEntry]  — 全部 entry
+        _cache_index : Dict[block_hash, entry_id]    — 只索引完整 block 的末尾 hash
+                       key = H(parent_hash, block_tokens)，覆盖整条前缀链
+        _free_lru    : OrderedDict[entry_id, None]   — 空闲 entry 的 LRU 链
+                       末尾 = 最近使用，头部 = 最旧（淘汰头部）
+
+    前缀匹配流程（borrow）:
+        1. 把 prompt_tokens 按 BLOCK_SIZE 切成完整块
+        2. 从 _ROOT_HASH 开始逐块计算 block_hash，查询 _cache_index
+        3. 找到最长连续命中前缀 → 对应 entry 的 KV data [0, matched_pos) 完全有效
+        4. 借出：ref_cnt += 1，从 _free_lru 移除
+        5. 调用方 set model_session.cache_pos = matched_pos，只对 suffix 做 prefill
+
+    写回流程（release）:
+        1. ref_cnt -= 1
+        2. 更新 cached_tokens = prompt_tokens + generated_tokens
+        3. 为新完整 block 计算 hash，若 _cache_index 无此 hash 或旧指针已失效则写入
+           （只用 token 数更多的 entry 覆盖，保证 index 始终指向最深缓存）
+        4. entry 加入 _free_lru 末尾
+    """
+
+    def __init__(self, model, max_entries: int = 32):
+        self._model = model
+        self._max_entries = max_entries
+        self._lock = threading.Lock()
+        self._entries: Dict[int, KVCacheEntry] = {}
+        self._cache_index: Dict[bytes, int] = {}         # block_hash → entry_id
+        self._free_lru: OrderedDict = OrderedDict()      # entry_id → None (LRU)
+        self._next_id: int = 0
+
+    # ── 公共接口 ──────────────────────────────────────────────────────────────
+
+    def borrow(
         self,
-        messages: List[Message],
-        max_tokens: int,
-        temperature: float,
-        top_k: int,
-        top_p: float,
-    ) -> Iterator[tuple]:
+        prompt_tokens: List[int],
+        owner_sid: str = "",
+        extra: bytes = b"",
+    ) -> Tuple[KVCacheEntry, int]:
         """
-        同步生成器，yield (token_id, text_delta)。
-        使用"全量 decode 做差"方法避免 BPE 边界乱码。
-        在独立 OS 线程中调用；thread_local CUDA Context 确保并发隔离。
+        查找并借出 prompt_tokens 的最长前缀命中 entry，返回 (entry, matched_pos)。
+
+        matched_pos : 命中的 token 数（对齐到 BLOCK_SIZE，0 = 无命中）
+        entry       : 已借出（ref_cnt += 1）；model_session.cache_pos 已设为 matched_pos
+
+        若无命中：创建新 entry（超出上限时 LRU 淘汰最旧空闲 entry）。
         """
-        prompt_tokens = self._tokenize(messages)
-
-        # 每次推理前重置 KV-Cache，直接传入完整 prompt
-        self.model_session.reset_cache()
-        new_tokens = prompt_tokens
-        if not new_tokens:
-            return
-
-        # 简洁实现：skip_special_tokens=True 直接输出干净文本。
-        # 思考模式已在 _tokenize 中通过 enable_thinking=False 禁用（Qwen3），
-        # 无需在此进行额外的 in_think 过滤。
-        accumulated_ids: List[int] = []
-        text_so_far: str = ""
-        generated_ids: List[int] = []
-
-        for token_id in self.model_session.stream_generate(
-            new_tokens,
-            max_new_tokens=max_tokens,
-            top_k=top_k,
-            top_p=top_p,
-            temperature=temperature,
-        ):
-            generated_ids.append(token_id)
-            accumulated_ids.append(token_id)
-
-            new_text = self.tokenizer.decode(
-                accumulated_ids,
-                skip_special_tokens=False,  # 保留 <think>...</think> 标签（DeepSeek/Qwen3 思考模型）
-                clean_up_tokenization_spaces=False,
+        with self._lock:
+            best_entry, best_pos = self._find_best_prefix(
+                prompt_tokens, owner_sid, extra
             )
-            # 过滤 <|token|> / <｜token｜>（含全角竖线 U+FF5C / SentencePiece ▁ U+2581 变体）
-            new_text = re.sub(r"<[\s|｜]*[^<>]*[|｜][^<>]*>", "", new_text)
-            delta = new_text[len(text_so_far):]
-            text_so_far = new_text
-            if delta:
-                yield token_id, delta
+            if best_entry is not None:
+                # 命中：rewind session 到前缀边界
+                best_entry.model_session.cache_pos = best_pos
+                best_entry.ref_cnt += 1
+                best_entry.last_access = time.monotonic()
+                best_entry.owner_sid = owner_sid
+                self._free_lru.pop(best_entry.entry_id, None)
+                return best_entry, best_pos
+            else:
+                # 未命中：分配新 entry（空 session，cache_pos = 0）
+                entry = self._alloc_entry()
+                entry.ref_cnt = 1
+                entry.last_access = time.monotonic()
+                entry.owner_sid = owner_sid
+                return entry, 0
 
-    def clear(self):
-        """清空 KV-Cache。"""
-        self.model_session.reset_cache()
+    def release(
+        self,
+        entry: KVCacheEntry,
+        prompt_tokens: List[int],
+        generated_tokens: List[int],
+        extra: bytes = b"",
+    ) -> None:
+        """
+        归还借出的 entry，把完整 block 发布到 _cache_index，然后加入 _free_lru。
+        cached_tokens 更新为 prompt_tokens + generated_tokens。
+        只有「完整 block」会被索引（末尾不足 BLOCK_SIZE 的 token 不缓存）。
+        """
+        with self._lock:
+            entry.cached_tokens = list(prompt_tokens) + list(generated_tokens)
+            self._publish_blocks(entry, extra)
+            entry.ref_cnt = max(0, entry.ref_cnt - 1)
+            entry.last_access = time.monotonic()
+            if entry.ref_cnt == 0:
+                self._free_lru[entry.entry_id] = None
+                self._free_lru.move_to_end(entry.entry_id)  # 最近使用 → 末尾
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {
+                "total_entries": len(self._entries),
+                "free_entries": len(self._free_lru),
+                "indexed_blocks": len(self._cache_index),
+            }
+
+    # ── 内部方法 ──────────────────────────────────────────────────────────────
+
+    def _compute_block_hashes(
+        self, tokens: List[int], extra: bytes
+    ) -> List[bytes]:
+        """返回 tokens 所有完整 block 的哈希链，长度 = len(tokens) // BLOCK_SIZE。"""
+        hashes: List[bytes] = []
+        parent = _ROOT_HASH
+        n_full = len(tokens) // BLOCK_SIZE
+        for i in range(n_full):
+            bt = tokens[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
+            bh = _block_hash(parent, bt, extra)
+            hashes.append(bh)
+            parent = bh
+        return hashes
+
+    def _find_best_prefix(
+        self,
+        prompt_tokens: List[int],
+        owner_sid: str,
+        extra: bytes,
+    ) -> Tuple[Optional[KVCacheEntry], int]:
+        """
+        查找最长前缀命中（持锁内调用）。
+
+        逐块计算 block_hash，在 _cache_index 中查找：
+          - 命中且 entry 空闲（ref_cnt == 0）→ 更新 best_entry / best_pos
+          - 未命中 / entry 被占用             → 停止（后续 hash 也不会命中）
+        同等匹配长度时，优先 owner_sid 相同的 entry（多轮对话偏好）。
+        """
+        n_full = len(prompt_tokens) // BLOCK_SIZE
+        if n_full == 0:
+            return None, 0
+
+        parent = _ROOT_HASH
+        best_entry: Optional[KVCacheEntry] = None
+        best_pos: int = 0
+
+        for i in range(n_full):
+            bt = prompt_tokens[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
+            bh = _block_hash(parent, bt, extra)
+
+            eid = self._cache_index.get(bh)
+            if eid is None:
+                break                                    # 链断裂，后续不会命中
+
+            entry = self._entries.get(eid)
+            if entry is None or entry.ref_cnt > 0:
+                break                                    # 无效或被占用
+
+            pos = (i + 1) * BLOCK_SIZE
+            # 防御性校验（防止极低概率哈希碰撞）
+            if (len(entry.cached_tokens) < pos or
+                    entry.cached_tokens[i * BLOCK_SIZE : pos] != bt):
+                break
+
+            if (pos > best_pos or
+                    (pos == best_pos and entry.owner_sid == owner_sid
+                     and (best_entry is None or best_entry.owner_sid != owner_sid))):
+                best_entry = entry
+                best_pos = pos
+
+            parent = bh
+
+        return best_entry, best_pos
+
+    def _publish_blocks(self, entry: KVCacheEntry, extra: bytes) -> None:
+        """
+        将 entry.cached_tokens 的完整 block 写入 _cache_index（持锁内调用）。
+        若某 block_hash 已被其他 entry 占用，仅当新 entry 的 cached_tokens
+        更长（更深缓存）时才覆盖，保证 index 始终指向最长可复用的 entry。
+        """
+        hashes = self._compute_block_hashes(entry.cached_tokens, extra)
+        entry.block_hashes = hashes
+        for bh in hashes:
+            existing_eid = self._cache_index.get(bh)
+            if existing_eid is None or existing_eid not in self._entries:
+                self._cache_index[bh] = entry.entry_id
+            else:
+                existing = self._entries[existing_eid]
+                if len(entry.cached_tokens) > len(existing.cached_tokens):
+                    self._cache_index[bh] = entry.entry_id  # 更深缓存优先
+
+    def _alloc_entry(self) -> KVCacheEntry:
+        """分配新 entry。超出上限时，LRU 淘汰最旧空闲 entry（持锁内调用）。"""
+        if len(self._entries) >= self._max_entries and self._free_lru:
+            self._evict_lru()
+        eid = self._next_id
+        self._next_id += 1
+        model_session = self._model.create_session()
+        entry = KVCacheEntry(entry_id=eid, model_session=model_session)
+        self._entries[eid] = entry
+        return entry
+
+    def _evict_lru(self) -> None:
+        """淘汰 _free_lru 头部（最旧）的空闲 entry（持锁内调用）。"""
+        if not self._free_lru:
+            return
+        eid, _ = self._free_lru.popitem(last=False)    # 弹出最旧（头部）
+        entry = self._entries.pop(eid, None)
+        if entry is None:
+            return
+        # 从 _cache_index 中撤销该 entry 的全部 block hash
+        for bh in entry.block_hashes:
+            if self._cache_index.get(bh) == eid:
+                del self._cache_index[bh]
+        # Qwen2Session 由 __del__ 自动调用 llaisysQwen2SessionDestroy 释放
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ModelServer：多用户 Session 池
+# 连续批处理调度器：请求队列 + 独立循环线程
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SPECIAL_FILTER = re.compile(r"<[\s|｜]*[^<>]*[|｜][^<>]*>")
+
+
+@dataclass
+class PendingRequest:
+    """HTTP 层提交给调度器的等待请求。"""
+    req_id: str
+    request: "ChatCompletionRequest"
+    session_id: str
+    prompt_tokens: List[int]
+    result_queue: asyncio.Queue     # ("delta", str) | ("done", None) | ("error", str)
+    loop: asyncio.AbstractEventLoop
+    tokenizer: object
+
+
+class ActiveRequest:
+    """
+    调度器正在迭代解码的单个请求。
+
+    持有借出的 KVCacheEntry，每次 decode_step() 推进一个 token，
+    生成结束后通过调度器归还 entry 到 KVCachePool。
+    """
+
+    def __init__(
+        self,
+        pending: PendingRequest,
+        entry: KVCacheEntry,
+        prompt_tokens: List[int],
+        first_token: int,
+        end_token: int,
+    ):
+        self.pending = pending
+        self.entry = entry
+        self.prompt_tokens = prompt_tokens
+        self.end_token = end_token
+        self.generated: List[int] = []
+        self.accumulated_ids: List[int] = []
+        self.text_so_far: str = ""
+        self.done: bool = False
+        self._step: int = 0
+        self._process_token(first_token)
+
+    def _process_token(self, tok: int) -> None:
+        req = self.pending.request
+        self.generated.append(tok)
+        self.accumulated_ids.append(tok)
+        self._step += 1
+
+        # 全量 decode 做差，避免 BPE 边界乱码
+        new_text = self.pending.tokenizer.decode(
+            self.accumulated_ids,
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        new_text = _SPECIAL_FILTER.sub("", new_text)
+        delta = new_text[len(self.text_so_far):]
+        self.text_so_far = new_text
+
+        if delta:
+            asyncio.run_coroutine_threadsafe(
+                self.pending.result_queue.put(("delta", delta)),
+                self.pending.loop,
+            )
+
+        if tok == self.end_token or self._step >= req.max_tokens:
+            self.done = True
+            asyncio.run_coroutine_threadsafe(
+                self.pending.result_queue.put(("done", None)),
+                self.pending.loop,
+            )
+
+    def decode_step(self) -> None:
+        """推进一步解码（线程安全：各 entry 的 model_session 独立，可并发）。"""
+        if self.done:
+            return
+        req = self.pending.request
+        try:
+            next_tok = self.entry.model_session._infer_sample(
+                [self.generated[-1]],
+                req.temperature, req.top_k, req.top_p,
+            )
+            self._process_token(next_tok)
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(
+                self.pending.result_queue.put(("error", str(exc))),
+                self.pending.loop,
+            )
+            self.done = True
+
+
+class ContinuousBatchScheduler:
+    """
+    请求池 + 单一循环线程实现的迭代级连续批处理调度器。
+
+    数据流:
+        HTTP → pending_queue (queue.Queue, 线程安全)
+                    ↓
+             调度主循环（独立 daemon 线程，永续运行）
+             ┌────────────────────────────────────────────────────┐
+             │ Phase 1 – PREFILL（串行，避免多路同时争 GPU）       │
+             │   新请求 → KVCachePool.borrow(prompt)              │
+             │   → 找最长前缀命中 → 只对 suffix 做 prefill       │
+             │   → 首 token 采样 → 构造 ActiveRequest            │
+             │                                                    │
+             │ Phase 2 – DECODE（线程池并发）                     │
+             │   每个 ActiveRequest.decode_step() 在独立线程执行  │
+             │   各 entry 持有独立 KV-Cache，互不干扰             │
+             │                                                    │
+             │ Phase 3 – CLEANUP                                  │
+             │   完成请求 → KVCachePool.release()                 │
+             │   → 更新 cached_tokens → 发布新 block hash        │
+             │   → entry 加入 free_lru，可被后续请求复用          │
+             └────────────────────────────────────────────────────┘
+    """
+
+    def __init__(
+        self,
+        kv_pool: KVCachePool,
+        max_batch_size: int = 8,
+        max_workers: int = 16,
+    ):
+        self._pool = kv_pool
+        self._max_batch = max_batch_size
+        self._pending: queue.Queue = queue.Queue()
+        self._executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="llaisys-decode",
+        )
+        self._thread = threading.Thread(
+            target=self._loop, daemon=True, name="llaisys-scheduler"
+        )
+        self._thread.start()
+
+    def submit(self, req: PendingRequest) -> None:
+        """将请求加入等待队列（线程安全，可在任意线程调用）。"""
+        self._pending.put(req)
+
+    # ── 内部 ──────────────────────────────────────────────────────────────────
+
+    def _prefill(self, pending: PendingRequest) -> Optional[ActiveRequest]:
+        """
+        在调度线程内串行执行 prefill:
+          1. KVCachePool.borrow(prompt) → (entry, matched_pos)
+          2. 只对 prompt[matched_pos:] 做 prefill（KV 前缀复用）
+          3. 首 token 采样 → 构造 ActiveRequest
+        """
+        req = pending.request
+        prompt = pending.prompt_tokens
+        try:
+            entry, matched_pos = self._pool.borrow(
+                prompt, owner_sid=pending.session_id
+            )
+            # 只 feed prefix 之后的 suffix token
+            suffix = prompt[matched_pos:]
+            if not suffix:
+                # 完整命中：回退一步，重新 feed 最后一个 token 以获取首生成 token
+                entry.model_session.cache_pos = max(0, matched_pos - 1)
+                suffix = [prompt[-1]] if prompt else []
+            if not suffix:
+                self._pool.release(entry, prompt, [])
+                asyncio.run_coroutine_threadsafe(
+                    pending.result_queue.put(("done", None)), pending.loop
+                )
+                return None
+            first_tok = entry.model_session._infer_sample(
+                suffix, req.temperature, req.top_k, req.top_p
+            )
+            end_tok = entry.model_session._meta.end_token
+            ar = ActiveRequest(pending, entry, prompt, first_tok, end_tok)
+            if ar.done:
+                self._release(ar)
+                return None
+            return ar
+        except Exception as exc:
+            asyncio.run_coroutine_threadsafe(
+                pending.result_queue.put(("error", str(exc))), pending.loop
+            )
+            return None
+
+    def _release(self, ar: ActiveRequest) -> None:
+        """请求完成，归还 entry 到 KVCachePool（更新 cached_tokens + 发布新 block）。"""
+        self._pool.release(ar.entry, ar.prompt_tokens, ar.generated)
+
+    def _loop(self) -> None:
+        """
+        调度主循环（独立 daemon 线程，永续运行）。
+
+        active_sids : 当前活跃 session ID 集合，保证同一 session 同时至多
+                      一个活跃请求（防止同一 KV 序列被并发写入）。
+        requeue_buf : 因 session 冲突暂缓的请求，当前轮结束后放回队列。
+        """
+        active: List[ActiveRequest] = []
+        active_sids: Set[str] = set()
+        requeue_buf: List[PendingRequest] = []
+
+        while True:
+            # ── Phase 1: 接受新请求（prefill 串行）────────────────────────────
+            slots = self._max_batch - len(active)
+            while slots > 0:
+                try:
+                    pending = self._pending.get_nowait()
+                    sid = pending.session_id
+                    if sid in active_sids:
+                        requeue_buf.append(pending)  # 同 session 已有活跃请求，暂缓
+                    else:
+                        active_sids.add(sid)
+                        ar = self._prefill(pending)
+                        if ar is not None:
+                            active.append(ar)
+                        else:
+                            active_sids.discard(sid)
+                        slots -= 1
+                except queue.Empty:
+                    break
+
+            # 暂缓请求放回队列（下一轮调度）
+            for p in requeue_buf:
+                self._pending.put(p)
+            requeue_buf.clear()
+
+            # ── 无活跃请求时阻塞等待新请求 ────────────────────────────────────
+            if not active:
+                try:
+                    pending = self._pending.get(timeout=0.005)
+                    sid = pending.session_id
+                    active_sids.add(sid)
+                    ar = self._prefill(pending)
+                    if ar is not None:
+                        active.append(ar)
+                    else:
+                        active_sids.discard(sid)
+                except queue.Empty:
+                    continue
+
+            # ── Phase 2: 并发执行 decode step ─────────────────────────────────
+            if len(active) == 1:
+                active[0].decode_step()   # 单请求直接在调度线程执行，省线程切换
+            else:
+                # 多请求：提交线程池并行执行（各 entry 持有独立 KV-Cache，互不干扰）
+                futs = {
+                    self._executor.submit(ar.decode_step): ar
+                    for ar in active
+                }
+                for f in concurrent.futures.as_completed(futs):
+                    try:
+                        f.result()
+                    except Exception:
+                        pass  # 错误已在 decode_step 内部回传给 result_queue
+
+            # ── Phase 3: 清理已完成请求，归还 KVCachePool ─────────────────────
+            still: List[ActiveRequest] = []
+            for ar in active:
+                if ar.done:
+                    self._release(ar)
+                    active_sids.discard(ar.pending.session_id)
+                else:
+                    still.append(ar)
+            active = still
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ModelServer：会话管理 + KVCachePool + 调度器
 # ─────────────────────────────────────────────────────────────────────────────
 
 class ModelServer:
     """
     多用户推理服务核心。
 
-    - 每个 session_id 对应一个独立 UserSession（独立 KV-Cache）
-    - 不同 session 的推理并发在不同线程执行（每线程独立 CUDA stream）
-    - 同一 session 内请求通过 asyncio.Lock 串行化，避免 KV-Cache 竞争
+    - KVCachePool     : 跨 session 的 KV-Cache 前缀匹配池（独立物理 session 对象池）
+    - ContinuousBatchScheduler : 请求队列 + 循环线程 + 迭代级批处理
+    - _sessions       : session_id → UserSession（轻量标识 + tokenizer）
     """
 
-    def __init__(self, model, tokenizer):
+    def __init__(self, model, tokenizer, pool_size: int = 32, max_batch: int = 8):
         self.model = model
         self.tokenizer = tokenizer
         self._sessions: Dict[str, UserSession] = {}
-        self._sessions_mu = threading.Lock()  # 保护 _sessions dict
+        self._sessions_mu = threading.Lock()
+        self.kv_pool = KVCachePool(model, max_entries=pool_size)
+        self.scheduler = ContinuousBatchScheduler(
+            self.kv_pool,
+            max_batch_size=max_batch,
+            max_workers=max(16, max_batch * 2),
+        )
 
     def get_or_create_session(self, session_id: str) -> UserSession:
         with self._sessions_mu:
             if session_id not in self._sessions:
-                model_session = self.model.create_session()
-                self._sessions[session_id] = UserSession(model_session, self.tokenizer)
+                self._sessions[session_id] = UserSession(session_id, self.tokenizer)
             return self._sessions[session_id]
 
     def delete_session(self, session_id: str):
         with self._sessions_mu:
-            if session_id in self._sessions:
-                self._sessions[session_id].clear()
-                del self._sessions[session_id]
+            self._sessions.pop(session_id, None)
 
     def clear_session(self, session_id: str):
-        with self._sessions_mu:
-            if session_id in self._sessions:
-                self._sessions[session_id].clear()
+        """将 session_id 的缓存条目在 KVCachePool 中标记为失效（清零其 cached_tokens）。"""
+        with self.kv_pool._lock:
+            for entry in list(self.kv_pool._entries.values()):
+                if entry.owner_sid == session_id and entry.ref_cnt == 0:
+                    # 撤销该 entry 的 block hash
+                    for bh in entry.block_hashes:
+                        if self.kv_pool._cache_index.get(bh) == entry.entry_id:
+                            del self.kv_pool._cache_index[bh]
+                    entry.cached_tokens = []
+                    entry.block_hashes = []
+                    entry.model_session.reset_cache()
 
     def session_count(self) -> int:
         with self._sessions_mu:
@@ -625,54 +1101,6 @@ def _make_sse_done(chat_id: str, model: str) -> str:
     return f"data: {json.dumps(data)}\n\ndata: [DONE]\n\n"
 
 
-async def _sse_stream(
-    user_session: UserSession,
-    request: "ChatCompletionRequest",
-    chat_id: str,
-) -> AsyncIterator[str]:
-    """
-    异步 SSE 生成器。
-
-    将同步推理放入单独 OS 线程，通过 asyncio.Queue 将
-    token 流传回事件循环。每个线程拥有独立的
-    thread_local Context（独立 CUDA stream），不同 session 完全并发。
-    """
-    loop = asyncio.get_event_loop()
-    queue: asyncio.Queue = asyncio.Queue(maxsize=256)
-
-    def worker():
-        try:
-            for _, delta in user_session._stream_tokens_sync(
-                request.messages,
-                request.max_tokens,
-                request.temperature,
-                request.top_k,
-                request.top_p,
-            ):
-                asyncio.run_coroutine_threadsafe(queue.put(("delta", delta)), loop)
-        except Exception as exc:
-            asyncio.run_coroutine_threadsafe(queue.put(("error", str(exc))), loop)
-        finally:
-            asyncio.run_coroutine_threadsafe(queue.put(("done", None)), loop)
-
-    thread = threading.Thread(target=worker, daemon=True)
-    thread.start()
-
-    while True:
-        kind, data = await queue.get()
-        if kind == "done":
-            yield _make_sse_done(chat_id, request.model)
-            break
-        if kind == "error":
-            yield _make_sse_chunk(f"[Error: {data}]", chat_id, request.model)
-            yield _make_sse_done(chat_id, request.model)
-            break
-        if kind == "delta" and data:
-            yield _make_sse_chunk(data, chat_id, request.model)
-
-    thread.join(timeout=5.0)
-
-
 @app.get("/", response_class=HTMLResponse)
 def index():
     return WEB_UI_HTML
@@ -680,6 +1108,15 @@ def index():
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: ChatCompletionRequest):
+    """
+    OpenAI-compatible /v1/chat/completions。
+
+    所有请求统一提交到 ContinuousBatchScheduler:
+      - 分词在 HTTP handler 中完成（纯 CPU，不阻塞事件循环）
+      - PendingRequest 入队 → 调度器 prefill（KVCachePool 前缀复用）
+      - 调度器 decode 循环推进 → token 通过 result_queue 回传事件循环
+      - 流式：SSE 实时推送；非流式：等全部 token 后一次性返回
+    """
     if _server is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
 
@@ -687,14 +1124,37 @@ async def chat_completions(request: ChatCompletionRequest):
     sid = request.session_id or "default"
     user_session = _server.get_or_create_session(sid)
 
+    loop = asyncio.get_event_loop()
+    result_queue: asyncio.Queue = asyncio.Queue(maxsize=512)
+    prompt_tokens = user_session._tokenize(request.messages)
+
+    pending = PendingRequest(
+        req_id=chat_id,
+        request=request,
+        session_id=sid,
+        prompt_tokens=prompt_tokens,
+        result_queue=result_queue,
+        loop=loop,
+        tokenizer=user_session.tokenizer,
+    )
+    _server.scheduler.submit(pending)
+
     if request.stream:
-        async def locked_stream():
-            async with user_session.lock:
-                async for chunk in _sse_stream(user_session, request, chat_id):
-                    yield chunk
+        async def sse_gen():
+            while True:
+                kind, data = await result_queue.get()
+                if kind == "done":
+                    yield _make_sse_done(chat_id, request.model)
+                    break
+                elif kind == "error":
+                    yield _make_sse_chunk(f"[Error: {data}]", chat_id, request.model)
+                    yield _make_sse_done(chat_id, request.model)
+                    break
+                elif kind == "delta" and data:
+                    yield _make_sse_chunk(data, chat_id, request.model)
 
         return StreamingResponse(
-            locked_stream(),
+            sse_gen(),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -703,18 +1163,16 @@ async def chat_completions(request: ChatCompletionRequest):
             },
         )
     else:
-        def blocking_generate():
-            parts = []
-            for _, delta in user_session._stream_tokens_sync(
-                request.messages, request.max_tokens,
-                request.temperature, request.top_k, request.top_p,
-            ):
-                parts.append(delta)
-            return "".join(parts)
-
-        async with user_session.lock:
-            reply = await asyncio.to_thread(blocking_generate)
-
+        parts: List[str] = []
+        while True:
+            kind, data = await result_queue.get()
+            if kind == "done":
+                break
+            elif kind == "error":
+                raise HTTPException(status_code=500, detail=data)
+            elif kind == "delta" and data:
+                parts.append(data)
+        reply = "".join(parts)
         return JSONResponse({
             "id": chat_id,
             "object": "chat.completion",
@@ -725,7 +1183,8 @@ async def chat_completions(request: ChatCompletionRequest):
                 "message": {"role": "assistant", "content": reply},
                 "finish_reason": "stop",
             }],
-            "usage": {"prompt_tokens": -1, "completion_tokens": -1, "total_tokens": -1},
+            "usage": {"prompt_tokens": len(prompt_tokens),
+                      "completion_tokens": -1, "total_tokens": -1},
         })
 
 
@@ -755,9 +1214,10 @@ def delete_session(session_id: str):
 
 @app.get("/v1/sessions")
 def list_sessions():
-    """查看当前活跃会话数量。"""
+    """查看当前活跃会话数量及 KVCachePool 统计。"""
     count = _server.session_count() if _server else 0
-    return {"active_sessions": count}
+    pool_stats = _server.kv_pool.stats() if _server else {}
+    return {"active_sessions": count, "kv_pool": pool_stats}
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -768,12 +1228,16 @@ def main():
     global _server
 
     parser = argparse.ArgumentParser(
-        description="LLAISYS Chat Server (OpenAI-compatible, multi-user)"
+        description="LLAISYS Chat Server (OpenAI-compatible, continuous batching + KV prefix cache)"
     )
     parser.add_argument("--model", required=True, help="模型目录路径")
     parser.add_argument("--device", default="cpu", choices=["cpu", "nvidia"])
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--pool-size", type=int, default=32,
+                        help="KVCachePool 最大 entry 数（每个 entry 占一个 Qwen2Session 的 KV 显存）")
+    parser.add_argument("--max-batch", type=int, default=8,
+                        help="调度器每轮最大并发请求数")
     args = parser.parse_args()
 
     import llaisys
@@ -789,9 +1253,12 @@ def main():
     model = llaisys.models.Qwen2(args.model, device)
     print("[server] 模型加载完成。")
 
-    _server = ModelServer(model, tokenizer)
+    _server = ModelServer(model, tokenizer,
+                          pool_size=args.pool_size,
+                          max_batch=args.max_batch)
 
-    print(f"[server] 多用户模式已启动: 每个 session_id 拥有独立 KV-Cache")
+    print(f"[server] KVCachePool 已启动: max_entries={args.pool_size}, block_size={BLOCK_SIZE} tokens")
+    print(f"[server] 调度器已启动: max_batch={args.max_batch}，前缀命中时只 prefill suffix")
     print(f"[server] 监听 http://{args.host}:{args.port}")
     print(f"[server] Web UI: http://localhost:{args.port}/")
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")
