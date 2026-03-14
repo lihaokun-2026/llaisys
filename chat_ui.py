@@ -212,39 +212,51 @@ def render_sidebar(conversations: list, current_id: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# 注入到 <head> 的 JS 代码 - 确保在页面加载时就执行
+# 历史对话点击处理 JS
 # ─────────────────────────────────────────────────────────────────────────────
 
 _HEAD_JS = """
 (function() {
-    console.log('[LLA] === Head JS loading ===');
+    console.log('[LLA] JS loaded');
     
     // 历史对话点击处理函数
     window.__llaHandleClick = function(event, sid) {
-        console.log('[LLA] Click handler called with sid:', sid);
         event.preventDefault();
         event.stopPropagation();
-        
-        // 查找隐藏的 textbox
+        console.log('[LLA] History click:', sid);
         var input = document.querySelector('#hcb input');
-        console.log('[LLA] Found input:', !!input);
-        if (!input) {
-            input = document.querySelector('#hcb textarea');
+        if (!input) input = document.querySelector('#hcb textarea');
+        if (input) {
+            input.value = sid;
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            input.dispatchEvent(new Event('change', {bubbles: true}));
         }
-        if (!input) {
-            console.log('[LLA] ERROR: No input found');
-            return;
-        }
-        
-        // 设置值并触发事件
-        console.log('[LLA] Setting value to:', sid);
-        input.value = sid;
-        input.dispatchEvent(new Event('input', {bubbles: true}));
-        input.dispatchEvent(new Event('change', {bubbles: true}));
-        console.log('[LLA] Events dispatched');
     };
     
-    console.log('[LLA] Head JS loaded, window.__llaHandleClick:', typeof window.__llaHandleClick);
+    // 只处理 Shift+Enter 换行，Enter 交给 Gradio 原生处理
+    function initKeyHandler() {
+        var ta = document.querySelector('#msg-input textarea');
+        if (!ta) {
+            setTimeout(initKeyHandler, 100);
+            return;
+        }
+        console.log('[LLA] Found textarea:', ta);
+        
+        ta.addEventListener('keydown', function(e) {
+            console.log('[LLA] Keydown:', e.key, 'Shift:', e.shiftKey);
+            if (e.key === 'Enter' && e.shiftKey) {
+                // Shift+Enter：允许默认换行行为，不做任何处理
+                console.log('[LLA] Shift+Enter - allow newline');
+            }
+            // Enter (without Shift): 不处理，完全交给 Gradio 原生的 msg_box.submit()
+        });
+    }
+    
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initKeyHandler);
+    } else {
+        initKeyHandler();
+    }
 })();
 """
 
@@ -666,57 +678,6 @@ def on_history_click(conv_id, conversations, server_url):
     return [], conv_id, render_sidebar(conversations, conv_id), "新对话", ""
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# 键盘行为：Enter = 发送，Shift+Enter = 换行
-# ─────────────────────────────────────────────────────────────────────────────
-
-_JS_ENTER_SEND = """
-() => {
-    console.log('[LLA] === Global JS loading ===');
-    
-    // ── Enter 发送，Shift+Enter 换行 ────────────────────────────────────────
-    document.addEventListener('keydown', function(e) {
-        var ta = document.querySelector('#msg-input textarea');
-        if (!ta || e.target !== ta || e.key !== 'Enter') return;
-        if (e.shiftKey) {
-            return;
-        }
-        e.preventDefault();
-        e.stopPropagation();
-        var btn = document.querySelector('#send-btn button');
-        if (btn && !btn.disabled) btn.click();
-    }, true);
-
-    // ── 历史对话点击处理函数 ───────────────────────────────────────
-    window.__llaHandleClick = function(event, sid) {
-        console.log('[LLA] Click handler called with sid:', sid);
-        event.preventDefault();
-        event.stopPropagation();
-        
-        // 查找隐藏的 textbox
-        var input = document.querySelector('#hcb input');
-        console.log('[LLA] Found input:', !!input);
-        if (!input) {
-            input = document.querySelector('#hcb textarea');
-        }
-        if (!input) {
-            console.log('[LLA] ERROR: No input found');
-            return;
-        }
-        
-        // 设置值并触发事件
-        console.log('[LLA] Setting value to:', sid);
-        input.value = sid;
-        input.dispatchEvent(new Event('input', {bubbles: true}));
-        input.dispatchEvent(new Event('change', {bubbles: true}));
-        console.log('[LLA] Events dispatched');
-    };
-    
-    console.log('[LLA] Global JS loaded, window.__llaHandleClick:', typeof window.__llaHandleClick);
-}
-"""
-
-
 def _restore_chat_history(conversations: list, session_id: str) -> list:
     """从 conversations 列表中恢复指定 session 的 chatbot 消息列表。"""
     for conv in conversations:
@@ -735,7 +696,7 @@ def build_ui(server_url: str) -> gr.Blocks:
 
     with gr.Blocks(title="LLAISYS Chat") as demo:
 
-        # ── State ──────────────────────────────────────────────────────────
+        # ── State ─────────────────────────────────────────────────────────
         session_id_st    = gr.State(saved_sid)
         server_url_st    = gr.State(server_url)
         conversations_st = gr.State(saved_convs)
@@ -858,7 +819,9 @@ def build_ui(server_url: str) -> gr.Blocks:
         gen_outputs = [chatbot, msg_box, conversations_st, history_html, conv_title_md]
 
         gen_event = send_btn.click(respond, inputs=gen_inputs, outputs=gen_outputs)
-        # Shift+Enter 发送由 JS 处理（点击 send_btn），不绑定 msg_box.submit 避免双重触发
+        
+        # 绑定 Enter 键发送（Gradio 原生支持）
+        msg_box.submit(respond, inputs=gen_inputs, outputs=gen_outputs)
 
         stop_btn.click(
             stop_generation,
@@ -929,7 +892,8 @@ def main():
             neutral_hue=gr.themes.colors.gray,
         ),
         css=CSS,
-        js=_JS_ENTER_SEND,        head='<script>' + _HEAD_JS + '</script>',    )
+        head=f'<script>{_HEAD_JS}</script>',
+    )
 
 
 if __name__ == "__main__":
