@@ -694,7 +694,7 @@ def build_ui(server_url: str) -> gr.Blocks:
     # 启动时从磁盘加载历史对话
     saved_convs, saved_sid = _load_conversations()
 
-    with gr.Blocks(title="LLAISYS Chat") as demo:
+    with gr.Blocks(title="LLAISYS模型聊天机器人") as demo:
 
         # ── State ─────────────────────────────────────────────────────────
         session_id_st    = gr.State(saved_sid)
@@ -757,7 +757,7 @@ def build_ui(server_url: str) -> gr.Blocks:
                 # 输入行
                 with gr.Row(elem_id="inp-zone"):
                     msg_box = gr.Textbox(
-                        placeholder="发消息给 LLAISYS…（Enter 发送，Shift+Enter 换行）",
+                        placeholder="发消息给 LLAISYS（Enter 换行，shift + Enter 发送）",
                         show_label=False, lines=2, max_lines=8,
                         scale=9, container=False, autofocus=True,
                         elem_id="msg-input",
@@ -886,6 +886,7 @@ def main():
         server_name=args.host,
         server_port=args.port,
         share=args.share,
+        favicon_path="assets/AI.ico",   # 新增这一行
         theme=gr.themes.Soft(
             primary_hue=gr.themes.colors.emerald,
             secondary_hue=gr.themes.colors.teal,
