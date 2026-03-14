@@ -41,6 +41,33 @@ except ImportError:
 import re as _re
 _STRIP_ANSI = _re.compile(r'\x1b\[[0-9;]*[mK]')
 
+# 清洗特殊 token 的正则
+# 使用 [^\n|｜<>] 代替 [\w._-]，以匹配 ▁（U+2581，SentencePiece 词边界符）等非 ASCII 字符
+_SPECIAL_TOKEN_RE = _re.compile(
+    r"<\s*[|｜]\s*[^\n|｜<>]{2,}\s*[|｜]\s*>",
+    _re.UNICODE,
+)
+# ▁ = U+2581（LOWER ONE EIGHTH BLOCK），Qwen EOS token 中使用，不是普通下划线
+_EOS_TOKEN_RE = _re.compile(
+    r"<\s*[|｜]\s*"
+    r"(?:end[▁_\-\s]*of[▁_\-\s]*(?:sentence|text|turn)"
+    r"|endoftext"
+    r"|im[▁_\-\s]*end"
+    r"|eot[▁_\-\s]*id"
+    r")\s*[|｜]\s*>",
+    _re.IGNORECASE,
+)
+# [^\n>]* 可匹配含 ▁ 的任意字符
+_PARTIAL_TAIL_RE = _re.compile(r"<(?:\s{0,3}[|｜][^\n>]*)?$")
+
+def _clean_reply(text: str) -> str:
+    """清洗模型输出中的特殊 token 和 EOS 标记。"""
+    text = _EOS_TOKEN_RE.sub("", text)
+    text = _SPECIAL_TOKEN_RE.sub("", text)
+    text = _PARTIAL_TAIL_RE.sub("", text)
+    text = text.replace("\ufffd", "")
+    return text.rstrip()
+
 def _input(prompt_ansi: str) -> str:
     """
     支持 CJK 宽字符退格的 input 封装。
@@ -115,6 +142,8 @@ def stream_chat(
     print("\033[32mAssistant\033[0m: ", end="", flush=True)
     reply = ""
     buf = ""
+    # hold-back 缓冲：缓存可能是特殊 token 不完整前缀的尾部
+    _hold = ""
 
     for raw in resp.iter_content(chunk_size=None):
         if not raw:
@@ -131,13 +160,41 @@ def stream_chat(
             try:
                 chunk = json.loads(payload)
                 delta = chunk["choices"][0]["delta"].get("content", "")
-                print(delta, end="", flush=True)
-                reply += delta
+                if not delta:
+                    continue
+                # 拼入 hold-back 缓冲
+                _hold += delta
+                # 检测是否包含完整 EOS 标记
+                eos_m = _EOS_TOKEN_RE.search(_hold)
+                if eos_m:
+                    _hold = _hold[:eos_m.start()]
+                # 检测尾部是否有未闭合的特殊 token 前缀
+                partial_m = _PARTIAL_TAIL_RE.search(_hold)
+                if partial_m:
+                    safe = _hold[:partial_m.start()]
+                    _hold = _hold[partial_m.start():]
+                else:
+                    safe = _hold
+                    _hold = ""
+                if safe:
+                    # 清洗完整特殊 token
+                    safe = _SPECIAL_TOKEN_RE.sub("", safe)
+                    print(safe, end="", flush=True)
+                    reply += safe
             except (json.JSONDecodeError, KeyError, IndexError):
                 pass
 
+    # 输出 hold-back 中残留的非特殊 token 文本
+    if _hold:
+        _hold = _EOS_TOKEN_RE.sub("", _hold)
+        _hold = _SPECIAL_TOKEN_RE.sub("", _hold)
+        _hold = _PARTIAL_TAIL_RE.sub("", _hold)
+        if _hold:
+            print(_hold, end="", flush=True)
+            reply += _hold
+
     print()  # 换行
-    return reply
+    return _clean_reply(reply)
 
 
 def clear_server_cache(server: str, session_id: str):
@@ -157,9 +214,10 @@ def print_help(temp=0.8, topk=50, topp=0.9, maxtok=512):
 可用命令：
   /quit               退出程序
   /new                新建对话
+  /clone [N]          新建对话并保留最近 N 轮上下文（默认 2 轮）
   /history            显示对话历史
   /sessions           列出所有会话
-  /switch <id>        切换会话（id 可由 /sessions 查看）
+  /switch <id>        切换会话ﾈid 可由 /sessions 查看）
   /edit <N>           编辑第 N 条用户消息并重新生成
   /temp  <0.0–2.0>    设置 temperature（当前：{temp}）
   /topk  <1–500>      设置 Top-K（当前：{topk}）
@@ -214,6 +272,31 @@ def chat_loop(server: str, default_session_id: str):
             current = get_session(new_id)
             current_id = new_id
             print(f"[新建对话 {new_id}]")
+
+        elif user_input.startswith("/clone"):
+            parts_cmd = user_input.split()
+            n_keep = 2
+            if len(parts_cmd) > 1:
+                try:
+                    n_keep = int(parts_cmd[1])
+                except ValueError:
+                    pass
+            # 保留最近 n_keep 轮对话作为示例上下文
+            kept: List[Dict] = []
+            rounds = 0
+            for m in reversed(current.messages):
+                if m["role"] == "user" and rounds >= n_keep:
+                    break
+                kept.insert(0, dict(m))
+                if m["role"] == "user":
+                    rounds += 1
+            new_id = f"s_{uuid.uuid4().hex[:8]}"
+            new_sess = get_session(new_id)
+            new_sess.messages = kept
+            new_sess.title = f"[续] {current.title[:20]}"
+            current = new_sess
+            current_id = new_id
+            print(f"[新建对话 {new_id}，保留 {len(kept)} 条示例消息]")  # noqa: E501
 
         elif user_input == "/history":
             if not current.messages:

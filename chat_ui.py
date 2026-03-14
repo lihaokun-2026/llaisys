@@ -8,6 +8,7 @@ LLAISYS Chat UI — Gradio 6.x  豆包风格（全屏 + 历史侧边栏）
 
 import html as _html
 import json
+import os
 import re
 import uuid
 import argparse
@@ -16,18 +17,132 @@ import gradio as gr
 import requests
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 本地持久化路径（JSON 文件存放对话历史）
+# ─────────────────────────────────────────────────────────────────────────────
+_PERSIST_DIR = os.path.join(os.path.expanduser("~"), ".llaisys")
+_PERSIST_FILE = os.path.join(_PERSIST_DIR, "chat_history.json")
+
+
+def _save_conversations(conversations: list, session_id: str) -> None:
+    """将 conversations 和 active session_id 写入磁盘 JSON。"""
+    try:
+        os.makedirs(_PERSIST_DIR, exist_ok=True)
+        data = {"session_id": session_id, "conversations": conversations}
+        with open(_PERSIST_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+    except Exception:
+        pass
+
+
+def _load_conversations():
+    """从磁盘加载 conversations 和 session_id。返回 (conversations, session_id)。"""
+    try:
+        if os.path.exists(_PERSIST_FILE):
+            with open(_PERSIST_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            convs = data.get("conversations", [])
+            sid = data.get("session_id", str(uuid.uuid4()))
+            if convs:
+                return convs, sid
+    except Exception:
+        pass
+    return [], str(uuid.uuid4())
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 工具函数
 # ─────────────────────────────────────────────────────────────────────────────
 
-# 匹配所有 <|token|> / <｜token｜> 变体（含全角竖线 U+FF5C、▁ U+2581、空格）
-_SPECIAL_RE = re.compile(r"<[\s|｜]*[^<>]*[|｜][^<>]*>", re.IGNORECASE | re.UNICODE)
+# 匹配 special token 变体：<|xxx|> / <｜xxx｜> / < | xxx | >（允许空格）
+# 使用 [^\n|｜<>] 代替 [\w._-]，以匹配 ▁（U+2581，SentencePiece 词边界符）等非 ASCII 字符
+_SPECIAL_RE = re.compile(
+    r"<\s*[|｜]\s*[^\n|｜<>]{2,}\s*[|｜]\s*>",
+    re.UNICODE,
+)
 
-def _clean(text: str) -> str:
-    return _SPECIAL_RE.sub("", text).strip()
+# 显式匹配常见 EOS 变体（宽松空格、中英文竖线、▁ 词边界符），作为兜底清洗
+# ▁ = U+2581（LOWER ONE EIGHTH BLOCK），Qwen EOS token 中使用，不是普通下划线
+_EOS_RE = re.compile(
+    r"<\s*[|｜]\s*"
+    r"(?:end[▁_\-\s]*of[▁_\-\s]*(?:sentence|text|turn)"
+    r"|endoftext"
+    r"|im[▁_\-\s]*end"
+    r"|eot[▁_\-\s]*id"
+    r")\s*[|｜]\s*>",
+    re.IGNORECASE,
+)
+
+# 尾部不完整的特殊 token 前缀（流式残留）
+# [^\n>]* 可匹配含 ▁ 的任意字符
+_PARTIAL_TAIL_RE = re.compile(r"<(?:\s{0,3}[|｜][^\n>]*)?$")
+
+def _to_text(content) -> str:
+    """
+    兼容 Gradio Chatbot 的多种 content 形态：
+      - str
+      - list[dict|str|...]
+      - dict（如多模态消息片段）
+    统一抽取为字符串，避免 re.sub 收到 list/dict 报错。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict):
+                # 常见字段：text / content / value
+                txt = item.get("text") or item.get("content") or item.get("value")
+                if isinstance(txt, str):
+                    parts.append(txt)
+        return "\n".join(p for p in parts if p)
+    if isinstance(content, dict):
+        txt = content.get("text") or content.get("content") or content.get("value")
+        return txt if isinstance(txt, str) else ""
+    return ""
+
+def _clean(text) -> str:
+    s = _to_text(text)
+    # 1) 显式移除 EOS 标记（最优先，避免被其他正则截断后残留）
+    s = _EOS_RE.sub("", s)
+    # 2) 去除特殊 token 形态
+    s = _SPECIAL_RE.sub("", s)
+    # 3) 去除尾部不完整的特殊 token 前缀（流式残留如 "< | end_of"）
+    s = _PARTIAL_TAIL_RE.sub("", s)
+    # 4) 常见乱码替换符 U+FFFD
+    s = s.replace("\ufffd", "")
+    # 5) 过滤大多数不可见控制字符（保留换行/制表）
+    s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)
+    return s.strip()
+
+def _trim_repetition(text: str, min_chunk: int = 80) -> str:
+    """
+    截掉文本末尾与前文重复的大段内容。
+
+    如果末尾 sz 个字符与紧邻前方 sz 个字符完全一致，说明模型陷入了
+    重复循环，移除末尾的重复副本。作为服务端检测的第二道防线。
+    """
+    n = len(text)
+    if n < min_chunk * 2:
+        return text
+    for sz in range(min_chunk, min(n // 2 + 1, 501), 30):
+        if text[-sz:] == text[-2 * sz : -sz]:
+            return text[:-sz].rstrip()
+    return text
 
 def _normalize_think(text: str) -> str:
-    if "</think>" in text and "<think>" not in text:
-        return "<think>" + text
+    """
+    确保 <think>...</think> 标签完整，让 Gradio reasoning_tags 正确渲染。
+    - 有 </think> 但没有 <think>：补头
+    - 有 <think> 但没有 </think>（流式中途）：补尾
+    - 连续多个 think 块不影响
+    """
+    has_open = "<think>" in text
+    has_close = "</think>" in text
+    if has_close and not has_open:
+        text = "<think>" + text
+    elif has_open and not has_close:
+        text = text + "\n</think>"
     return text
 
 def _strip_think(text: str) -> str:
@@ -54,7 +169,7 @@ def _build_api_messages(history: list) -> list:
 def _conv_title(history: list) -> str:
     for m in history:
         if m.get("role") == "user":
-            text = re.sub(r"<[^>]+>", "", m.get("content", "")).strip()
+            text = re.sub(r"<[^>]+>", "", _clean(m.get("content", ""))).strip()
             return (text[:22] + "…") if len(text) > 22 else text
     return "新对话"
 
@@ -92,13 +207,8 @@ def render_sidebar(conversations: list, current_id: str) -> str:
         )
     if not items:
         items = '<div class="hempty">暂无历史对话</div>'
-    js = ("<script>function __llaSel(id){"
-          "var e=document.querySelector('#hcb textarea')||document.querySelector('#hcb input');"
-          "if(e){e.value=id;e.dispatchEvent(new Event('input',{bubbles:true}));}}"
-          "</script>")
-    return f'<div id="hsc">{items}</div>{js}'
-
-
+    # __llaSel 在 demo.launch(js=) 中全局注册，此处无需重复注入 <script>
+    return f'<div id="hsc">{items}</div>'
 # ─────────────────────────────────────────────────────────────────────────────
 # CSS — 豆包全屏布局
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,8 +228,8 @@ html, body {
     background: transparent !important; overflow: hidden !important;
 }
 .gradio-container .main,
-.gradio-container .contain,
-.gradio-container .wrap {
+.gradio-container > .main > .contain,
+.gradio-container > .main > .contain > .wrap {
     height: 100vh !important; max-height: 100vh !important;
     padding: 0 !important; margin: 0 !important;
     overflow: hidden !important; max-width: 100% !important;
@@ -199,8 +309,19 @@ footer { display: none !important; }
 .hempty { color: #9ca3af !important; font-size: 12px !important;
     text-align: center !important; padding: 24px 0 !important; }
 
-/* Hidden JS click receiver */
-#hcb { display: none !important; }
+/* Hidden JS click receiver — offscreen but still in DOM for JS access */
+#hcb { position: absolute !important; left: -9999px !important;
+    width: 1px !important; height: 1px !important; overflow: hidden !important; }
+
+/* 侧边栏 & 右侧参数面板：不被全局 overflow:hidden 截断 */
+#sidebar .wrap, #sidebar .contain,
+#rp-col .wrap, #rp-col .contain {
+    height: auto !important; max-height: none !important;
+    overflow: visible !important;
+}
+#rp-col {
+    overflow-y: auto !important;
+}
 
 /* Sidebar bottom */
 #sb-bot { border-top: 1px solid #efefef !important; padding: 12px 16px !important;
@@ -295,6 +416,12 @@ footer { display: none !important; }
     border-color: #fca5a5 !important; color: #dc2626 !important;
     background: #fff8f8 !important;
 }
+#stop-btn button {
+    border-color: #fca5a5 !important; color: #dc2626 !important;
+}
+#stop-btn button:hover {
+    background: #fff1f2 !important; border-color: #f87171 !important;
+}
 
 /* ══ RIGHT PANEL ═════════════════════════════════════════════════════════════ */
 #rp-col {
@@ -341,11 +468,44 @@ footer { display: none !important; }
 
 /* ══ CODE BLOCKS ═════════════════════════════════════════════════════════════ */
 code, pre { font-family: 'JetBrains Mono','Fira Code',Consolas,monospace !important; }
-pre { background: #1e2433 !important; border-radius: 8px !important;
+pre { background: #1e1e2e !important; border-radius: 8px !important;
     padding: 14px 16px !important; overflow-x: auto !important; border: none !important; }
-pre code { color: #e2e8f0 !important; font-size: 13px !important; line-height: 1.6 !important; }
+pre code { color: #cdd6f4 !important; font-size: 13px !important; line-height: 1.6 !important; }
 :not(pre) > code { background: #f1f4f8 !important; color: #d63384 !important;
     border-radius: 4px !important; padding: 2px 5px !important; font-size: 13px !important; }
+
+/* ── Catppuccin Mocha 暗色语法高亮（覆盖 Highlight.js 默认配色） ───────── */
+pre code .hljs-keyword,
+pre code .token.keyword        { color: #cba6f7 !important; }  /* 紫色: if/for/def/class/import */
+pre code .hljs-built_in,
+pre code .token.builtin         { color: #fab387 !important; }  /* 橘色: print/len/range */
+pre code .hljs-string,
+pre code .token.string          { color: #a6e3a1 !important; }  /* 绿色: "hello" */
+pre code .hljs-number,
+pre code .token.number          { color: #fab387 !important; }  /* 橘色: 42, 3.14 */
+pre code .hljs-title,
+pre code .hljs-title\\.function_,
+pre code .token.function        { color: #89b4fa !important; }  /* 蓝色: 函数名 */
+pre code .hljs-comment,
+pre code .token.comment         { color: #7f849c !important; font-style: italic !important; }
+pre code .hljs-variable,
+pre code .token.variable        { color: #f38ba8 !important; }  /* 粉红: 变量 */
+pre code .hljs-operator,
+pre code .token.operator        { color: #89dceb !important; }  /* 青色: = + - * / % */
+pre code .hljs-punctuation,
+pre code .token.punctuation     { color: #bac2de !important; }  /* 浅灰: () [] {} , ; */
+pre code .hljs-params           { color: #cdd6f4 !important; }  /* 白色: 函数参数 */
+pre code .hljs-meta,
+pre code .token.decorator       { color: #f38ba8 !important; }  /* 粉红: @decorator */
+pre code .hljs-literal,
+pre code .token.boolean         { color: #fab387 !important; }  /* 橘色: True/False/None */
+pre code .hljs-type,
+pre code .hljs-name             { color: #f9e2af !important; }  /* 黄色: 类型名/标签名 */
+pre code .hljs-attr,
+pre code .token.attr-name       { color: #f9e2af !important; }  /* 黄色: 属性名 */
+pre code .hljs-symbol           { color: #f2cdcd !important; }
+pre code .hljs-selector-class   { color: #f9e2af !important; }
+pre code .hljs-selector-tag     { color: #cba6f7 !important; }
 """
 
 
@@ -354,7 +514,7 @@ pre code { color: #e2e8f0 !important; font-size: 13px !important; line-height: 1
 # ─────────────────────────────────────────────────────────────────────────────
 
 def respond(user_msg, history, session_id, server_url,
-            temperature, top_k, top_p, max_tokens, conversations):
+            temperature, top_k, top_p, max_tokens, thinking_budget, conversations):
     if not user_msg.strip():
         yield history, "", conversations, render_sidebar(conversations, session_id), \
               _get_title_by_id(conversations, session_id)
@@ -377,13 +537,14 @@ def respond(user_msg, history, session_id, server_url,
         with requests.post(
             f"{server_url}/v1/chat/completions",
             json={
-                "messages":    api_msgs,
-                "temperature": float(temperature),
-                "top_k":       int(top_k),
-                "top_p":       float(top_p),
-                "max_tokens":  int(max_tokens),
-                "stream":      True,
-                "session_id":  session_id,
+                "messages":        api_msgs,
+                "temperature":     float(temperature),
+                "top_k":           int(top_k),
+                "top_p":           float(top_p),
+                "max_tokens":      int(max_tokens),
+                "thinking_budget": int(thinking_budget),
+                "stream":          True,
+                "session_id":      session_id,
             },
             stream=True, timeout=300,
         ) as resp:
@@ -410,11 +571,13 @@ def respond(user_msg, history, session_id, server_url,
         yield history, "", conversations, pre_sidebar, pre_title
         return
 
-    history[-1]["content"] = _normalize_think(_clean(full_text))
+    history[-1]["content"] = _normalize_think(_trim_repetition(_clean(full_text)))
     # 生成完毕：更新历史记录和侧边栏
     updated_convs = _update_conversations(conversations, session_id, history)
     new_title     = _conv_title(history)
     new_sidebar   = render_sidebar(updated_convs, session_id)
+    # 持久化到磁盘
+    _save_conversations(updated_convs, session_id)
     yield history, "", updated_convs, new_sidebar, new_title
 
 
@@ -424,13 +587,25 @@ def do_clear(session_id, server_url, conversations):
     except Exception:
         pass
     # 清空消息，保留此会话 id
-    sidebar = render_sidebar(conversations, session_id)
-    title   = _get_title_by_id(conversations, session_id) or "新对话"
-    return [], "", sidebar, title
+    # 同时更新 conversations 中该 session 的消息
+    updated_convs = _update_conversations(conversations, session_id, [])
+    _save_conversations(updated_convs, session_id)
+    sidebar = render_sidebar(updated_convs, session_id)
+    title   = _get_title_by_id(updated_convs, session_id) or "新对话"
+    return [], "", updated_convs, sidebar, title
+
+
+def stop_generation(session_id: str, server_url: str):
+    """通知服务器立即停止当前会话的生成。"""
+    try:
+        requests.post(f"{server_url}/v1/sessions/{session_id}/abort", timeout=2)
+    except Exception:
+        pass
 
 
 def do_new_session(conversations):
     new_id  = str(uuid.uuid4())
+    _save_conversations(conversations, new_id)
     sidebar = render_sidebar(conversations, new_id)
     return [], "", new_id, sidebar, "新对话"
 
@@ -448,16 +623,64 @@ def on_history_click(conv_id, conversations, server_url):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 键盘行为：Enter = 发送，Shift+Enter = 换行
+# ─────────────────────────────────────────────────────────────────────────────
+
+_JS_ENTER_SEND = """
+() => {
+    // ── Shift+Enter 发送，Enter 换行 ────────────────────────────────────────
+    document.addEventListener('keydown', function(e) {
+        var ta = document.querySelector('#msg-input textarea');
+        if (!ta || e.target !== ta || e.key !== 'Enter') return;
+        if (e.shiftKey) {
+            // Shift+Enter = 发送
+            e.preventDefault();
+            e.stopPropagation();
+            var btn = document.querySelector('#send-btn button');
+            if (btn && !btn.disabled) btn.click();
+            return;
+        }
+        // 普通 Enter = 换行（不拦截，走默认行为）
+    }, true);
+
+    // ── 历史对话切换：全局注册，供侧边栏 onclick 调用 ─────────────────────
+    // Gradio 用 React 受控输入，必须通过原生 setter 触发 input 事件才有效
+    window.__llaSel = function(id) {
+        var e = document.querySelector('#hcb textarea')
+                || document.querySelector('#hcb input');
+        if (!e) return;
+        var proto = e.tagName === 'TEXTAREA'
+            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+        var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+        setter.call(e, id);
+        e.dispatchEvent(new Event('input', {bubbles: true}));
+    };
+}
+"""
+
+
+def _restore_chat_history(conversations: list, session_id: str) -> list:
+    """从 conversations 列表中恢复指定 session 的 chatbot 消息列表。"""
+    for conv in conversations:
+        if conv["id"] == session_id:
+            return conv.get("messages", [])
+    return []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # UI 构建
 # ─────────────────────────────────────────────────────────────────────────────
 
 def build_ui(server_url: str) -> gr.Blocks:
+    # 启动时从磁盘加载历史对话
+    saved_convs, saved_sid = _load_conversations()
+
     with gr.Blocks(title="LLAISYS Chat") as demo:
 
         # ── State ──────────────────────────────────────────────────────────
-        session_id_st    = gr.State(str(uuid.uuid4()))
+        session_id_st    = gr.State(saved_sid)
         server_url_st    = gr.State(server_url)
-        conversations_st = gr.State([])
+        conversations_st = gr.State(saved_convs)
 
         with gr.Row(elem_id="outer-row"):
 
@@ -473,12 +696,12 @@ def build_ui(server_url: str) -> gr.Blocks:
                     gr.Markdown("历史对话")
 
                 history_html = gr.HTML(
-                    render_sidebar([], ""),
+                    render_sidebar(saved_convs, saved_sid),
                     elem_id="sb-hist",
                 )
 
-                # 隐藏的 textbox，接收侧边栏 JS 点击事件
-                hist_click = gr.Textbox(value="", visible=False, elem_id="hcb")
+                # 隐藏的 textbox，接收侧边栏 JS 点击事件（CSS offscreen 隐藏，保留 DOM）
+                hist_click = gr.Textbox(value="", show_label=False, container=False, elem_id="hcb")
 
                 with gr.Row(elem_id="sb-bot"):
                     gr.Markdown("👤 &nbsp;LLAISYS User")
@@ -488,7 +711,9 @@ def build_ui(server_url: str) -> gr.Blocks:
 
                 # 顶部标题栏
                 with gr.Row(elem_id="ct-bar"):
-                    conv_title_md = gr.Markdown("新对话")
+                    conv_title_md = gr.Markdown(
+                        _get_title_by_id(saved_convs, saved_sid)
+                    )
 
                 # 聊天区
                 chatbot = gr.Chatbot(
@@ -498,6 +723,7 @@ def build_ui(server_url: str) -> gr.Blocks:
                     render_markdown=True,
                     sanitize_html=False,
                     reasoning_tags=[("<think>", "</think>")],
+                    value=_restore_chat_history(saved_convs, saved_sid),
                     placeholder=(
                         "<div style='text-align:center;padding:100px 20px 40px'>"
                         "<div style='font-size:52px;margin-bottom:16px;opacity:.35'>✦</div>"
@@ -512,7 +738,7 @@ def build_ui(server_url: str) -> gr.Blocks:
                 # 输入行
                 with gr.Row(elem_id="inp-zone"):
                     msg_box = gr.Textbox(
-                        placeholder="发消息给 LLAISYS… （Enter 发送，Shift+Enter 换行）",
+                        placeholder="发消息给 LLAISYS…（Shift+Enter 发送，Enter 换行）",
                         show_label=False, lines=2, max_lines=8,
                         scale=9, container=False, autofocus=True,
                         elem_id="msg-input",
@@ -525,22 +751,28 @@ def build_ui(server_url: str) -> gr.Blocks:
                 # 操作行
                 with gr.Row(elem_id="act-row"):
                     clear_btn = gr.Button("🗑  清空对话", size="sm", elem_id="clear-btn")
+                    stop_btn  = gr.Button("⏹  停止生成", size="sm", elem_id="stop-btn")
 
             # ══ RIGHT SETTINGS PANEL ═══════════════════════════════════════
             with gr.Column(scale=0, min_width=260, elem_id="rp-col"):
                 gr.Markdown("### ⚙️  生成参数")
                 temperature = gr.Slider(
-                    minimum=0.0, maximum=2.0, value=0.7, step=0.05,
+                    minimum=0.0, maximum=2.0, value=0.5, step=0.05,
                     label="温度 Temperature", info="↑ 更随机 · ↓ 更保守",
                 )
                 top_k = gr.Slider(
-                    minimum=1, maximum=200, value=50, step=1, label="Top-K",
+                    minimum=1, maximum=200, value=30, step=1, label="Top-K",
                 )
                 top_p = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top-P  核采样",
+                    minimum=0.0, maximum=1.0, value=0.85, step=0.05, label="Top-P  核采样",
                 )
                 max_tokens = gr.Slider(
-                    minimum=64, maximum=4096, value=1024, step=64, label="最大 Token 数",
+                    minimum=64, maximum=4096, value=2048, step=64, label="最大 Token 数",
+                )
+                thinking_budget = gr.Slider(
+                    minimum=0, maximum=3000, value=800, step=100,
+                    label="思考限额 (think 块最多字符数)",
+                    info="0 = 不限制",
                 )
                 gr.Markdown(
                     "<hr style='border-color:#ebebeb;margin:14px 0'/>\n\n"
@@ -550,20 +782,37 @@ def build_ui(server_url: str) -> gr.Blocks:
                     "适用于 **DeepSeek-R1**、\n"
                     "**Qwen3** 等推理模型。"
                 )
+                gr.Markdown("<hr style='border-color:#ebebeb;margin:14px 0'/>")
+                gr.Markdown("### 🔄  模型")
+                model_dropdown = gr.Dropdown(
+                    choices=["Qwen2"],
+                    value="Qwen2",
+                    label="当前模型",
+                    interactive=False,
+                    info="服务端加载的模型",
+                )
 
         # ── 事件绑定 ────────────────────────────────────────────────────────
         # gen_outputs: [chatbot, msg_box, conversations_st, history_html, conv_title_md]
         gen_inputs  = [msg_box, chatbot, session_id_st, server_url_st,
-                       temperature, top_k, top_p, max_tokens, conversations_st]
+                       temperature, top_k, top_p, max_tokens, thinking_budget,
+                       conversations_st]
         gen_outputs = [chatbot, msg_box, conversations_st, history_html, conv_title_md]
 
-        send_btn.click(respond, inputs=gen_inputs, outputs=gen_outputs)
-        msg_box.submit(respond, inputs=gen_inputs, outputs=gen_outputs)
+        gen_event = send_btn.click(respond, inputs=gen_inputs, outputs=gen_outputs)
+        # Shift+Enter 发送由 JS 处理（点击 send_btn），不绑定 msg_box.submit 避免双重触发
+
+        stop_btn.click(
+            stop_generation,
+            inputs=[session_id_st, server_url_st],
+            outputs=[],
+            cancels=[gen_event],
+        )
 
         clear_btn.click(
             do_clear,
             inputs=[session_id_st, server_url_st, conversations_st],
-            outputs=[chatbot, msg_box, history_html, conv_title_md],
+            outputs=[chatbot, msg_box, conversations_st, history_html, conv_title_md],
         )
 
         sb_new_btn.click(
@@ -572,10 +821,24 @@ def build_ui(server_url: str) -> gr.Blocks:
             outputs=[chatbot, msg_box, session_id_st, history_html, conv_title_md],
         )
 
-        hist_click.change(
+        hist_click.input(
             on_history_click,
             inputs=[hist_click, conversations_st, server_url_st],
             outputs=[chatbot, session_id_st, msg_box, history_html, conv_title_md, hist_click],
+        )
+
+        # 每次浏览器连接/刷新时从磁盘重新加载历史，避免刷新后丢失会话
+        def _on_page_load():
+            convs, sid = _load_conversations()
+            history = _restore_chat_history(convs, sid)
+            sidebar = render_sidebar(convs, sid)
+            title = _get_title_by_id(convs, sid) or "新对话"
+            return convs, sid, history, sidebar, title
+
+        demo.load(
+            _on_page_load,
+            inputs=[],
+            outputs=[conversations_st, session_id_st, chatbot, history_html, conv_title_md],
         )
 
     return demo
@@ -607,6 +870,7 @@ def main():
             neutral_hue=gr.themes.colors.gray,
         ),
         css=CSS,
+        js=_JS_ENTER_SEND,
     )
 
 

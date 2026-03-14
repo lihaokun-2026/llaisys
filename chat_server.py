@@ -43,13 +43,15 @@ class Message(BaseModel):
 class ChatCompletionRequest(BaseModel):
     model: str = "llaisys"
     messages: List[Message]
-    temperature: float = Field(default=0.8, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
-    top_k: int = Field(default=50, ge=1)
-    max_tokens: int = Field(default=512, ge=1)
+    temperature: float = Field(default=0.5, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.85, ge=0.0, le=1.0)
+    top_k: int = Field(default=30, ge=1)
+    max_tokens: int = Field(default=2048, ge=1)
     stream: bool = False
     # 扩展字段：会话 ID，用于 KV-Cache 前缀复用
     session_id: Optional[str] = "default"
+    # 思考预算：<think> 块最多可生成的字符数（0 = 不限制）
+    thinking_budget: int = Field(default=800, ge=0)
 
 
 
@@ -68,12 +70,22 @@ class UserSession:
         self.tokenizer = tokenizer
         self.lock = asyncio.Lock()
 
+    # 默认系统提示：鼓励简洁、避免无限罗列
+    _DEFAULT_SYSTEM = (
+        "你是一个有帮助的AI助手。请简洁清晰地回答问题，"
+        "避免过度展开、无限罗列或重复相似内容。"
+        "如需思考，请控制思考长度，直接给出核心答案。"
+    )
+
     def _tokenize(self, messages: List[Message]) -> List[int]:
         msgs = [{"role": m.role, "content": m.content} for m in messages]
+        # 若没有 system 消息，自动插入默认提示词
+        if not msgs or msgs[0]["role"] != "system":
+            msgs.insert(0, {"role": "system", "content": self._DEFAULT_SYSTEM})
         try:
             prompt = self.tokenizer.apply_chat_template(
                 msgs, add_generation_prompt=True, tokenize=False,
-                enable_thinking=False
+                enable_thinking=True
             )
         except TypeError:
             prompt = self.tokenizer.apply_chat_template(
@@ -216,13 +228,22 @@ class KVCachePool:
         只有「完整 block」会被索引（末尾不足 BLOCK_SIZE 的 token 不缓存）。
         """
         with self._lock:
-            entry.cached_tokens = list(prompt_tokens) + list(generated_tokens)
+            # 关键修复：Qwen2Session 的 cache_pos 只统计“作为输入喂给模型”的 token。
+            # 生成流程里最后一个已输出 token 通常尚未作为下一步输入写入 KV，
+            # 因此不能盲目把 prompt + generated 全部当成可复用 KV。
+            full_tokens = list(prompt_tokens) + list(generated_tokens)
+            real_cached = int(getattr(entry.model_session, "cache_pos", len(full_tokens)))
+            if real_cached < 0:
+                real_cached = 0
+            if real_cached > len(full_tokens):
+                real_cached = len(full_tokens)
+            entry.cached_tokens = full_tokens[:real_cached]
             self._publish_blocks(entry, extra)
             entry.ref_cnt = max(0, entry.ref_cnt - 1)
             entry.last_access = time.monotonic()
             if entry.ref_cnt == 0:
                 self._free_lru[entry.entry_id] = None
-                self._free_lru.move_to_end(entry.entry_id)  # 最近使用 → 末尾
+                self._free_lru.move_to_end(entry.entry_id)
 
     def stats(self) -> dict:
         with self._lock:
@@ -231,8 +252,6 @@ class KVCachePool:
                 "free_entries": len(self._free_lru),
                 "indexed_blocks": len(self._cache_index),
             }
-
-    # ── 内部方法 ──────────────────────────────────────────────────────────────
 
     def _compute_block_hashes(
         self, tokens: List[int], extra: bytes
@@ -286,6 +305,12 @@ class KVCachePool:
             # 防御性校验（防止极低概率哈希碰撞）
             if (len(entry.cached_tokens) < pos or
                     entry.cached_tokens[i * BLOCK_SIZE : pos] != bt):
+                break
+            # 关键修复：必须确保底层 Qwen2Session 的真实 KV 至少覆盖到 pos。
+            # 否则会把“逻辑上记录了 token，但 KV 实际未写入”的状态误判为命中，
+            # 导致后续解码异常（如提前 EOS、输出中断）。
+            real_cache_pos = int(getattr(entry.model_session, "cache_pos", 0))
+            if real_cache_pos < pos:
                 break
 
             if (pos > best_pos or
@@ -345,7 +370,45 @@ class KVCachePool:
 # 连续批处理调度器：请求队列 + 独立循环线程
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SPECIAL_FILTER = re.compile(r"<[\s|｜]*[^<>]*[|｜][^<>]*>")
+# 终止生成：session_id → bool，由 /v1/sessions/{sid}/abort 端点设置，_process_token 消费后清除
+_session_abort: Dict[str, bool] = {}
+_session_abort_mu = threading.Lock()
+
+# 匹配 special token 变体：<|xxx|> / <｜xxx｜> / < | xxx | >（允许空格）
+# 使用 [^\n|｜<>] 代替 [\w._-]，以匹配 ▁（U+2581，SentencePiece 词边界符）等非 ASCII 字符
+_SPECIAL_FILTER = re.compile(
+    r"<\s*[|｜]\s*[^\n|｜<>]{2,}\s*[|｜]\s*>",
+    re.UNICODE,
+)
+
+# 文本级 EOS 标记检测：模型有时把 EOS 当文本输出而非 token ID
+# ▁ = U+2581（LOWER ONE EIGHTH BLOCK），Qwen EOS token 中使用，不是普通下划线
+_EOS_TEXT_RE = re.compile(
+    r"<\s*[|｜]\s*"
+    r"(?:end[▁_\-\s]*of[▁_\-\s]*(?:sentence|text|turn)"
+    r"|endoftext"
+    r"|im[▁_\-\s]*end"
+    r"|eot[▁_\-\s]*id"
+    r")\s*[|｜]\s*>",
+    re.IGNORECASE,
+)
+
+# 流式 hold-back：检测文本尾部可能是特殊 token 的不完整前缀
+# [^\n>]* 可匹配含 ▁ 的任意字符，避免 hold-back 失效
+_PARTIAL_SPECIAL_TAIL = re.compile(r"<(?:\s{0,3}[|｜][^\n>]*)?$")
+
+
+def _sanitize_generated_text(text: str) -> str:
+        """
+        服务端统一文本清洗：
+            1) 去掉 <|...|> / <｜...｜> / < | ... | > 特殊 token
+            2) 去掉 U+FFFD（常见乱码替换符）
+            3) 去掉不可见控制字符（保留换行/制表）
+        """
+        s = _SPECIAL_FILTER.sub("", text)
+        s = s.replace("\ufffd", "")
+        s = re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]", "", s)
+        return s
 
 
 @dataclass
@@ -383,9 +446,50 @@ class ActiveRequest:
         self.generated: List[int] = []
         self.accumulated_ids: List[int] = []
         self.text_so_far: str = ""
+        self._text_emitted: str = ""          # 已发送给客户端的文本（思考截断后差量基线）
         self.done: bool = False
         self._step: int = 0
+        # 思考预算控制
+        self._thinking_budget: int = getattr(pending.request, 'thinking_budget', 800)
+        self._think_suppressed: bool = False  # 是否正在抑制过长的思考内容
         self._process_token(first_token)
+
+    # ── 文本级多尺度重复检测 ──────────────────────────────────────────────────
+
+    def _check_repetition(self) -> bool:
+        """
+        文本级多尺度重复检测。
+
+        第一层：短周期连续重复检测（15-200 字符的模式连续出现 ≥3 次）。
+                适用于模型反复输出"列表的索引和切片"等短循环。
+        第二层：大块子串检测（120-500 字符在前文中出现过）。
+                适用于模型在更长尺度上的回环。
+        """
+        text = self.text_so_far
+        n = len(text)
+        if n < 60:
+            return False
+
+        # ── 第一层：短周期连续重复（3 连击） ──────────────────────────────
+        tail = text[-600:] if n > 600 else text
+        ct = len(tail)
+        for plen in range(15, min(ct // 3 + 1, 201)):
+            if ct >= 3 * plen:
+                pat = tail[-plen:]
+                if (tail[-2 * plen : -plen] == pat
+                        and tail[-3 * plen : -2 * plen] == pat):
+                    return True
+
+        # ── 第二层：大块子串检测 ──────────────────────────────────────────
+        if n < 240:
+            return False
+        upper = min(n // 2, 500) + 1
+        for sz in range(120, upper, 40):
+            if text[-sz:] in text[:-sz]:
+                return True
+        return False
+
+    # ── token 处理 ────────────────────────────────────────────────────────────
 
     def _process_token(self, tok: int) -> None:
         req = self.pending.request
@@ -393,21 +497,110 @@ class ActiveRequest:
         self.accumulated_ids.append(tok)
         self._step += 1
 
-        # 全量 decode 做差，避免 BPE 边界乱码
-        new_text = self.pending.tokenizer.decode(
+        # ── 中止检测（非阻塞，每 token 检查一次）────────────────────────────
+        if _session_abort.get(self.pending.session_id, False):
+            with _session_abort_mu:
+                _session_abort.pop(self.pending.session_id, None)
+            self.done = True
+            asyncio.run_coroutine_threadsafe(
+                self.pending.result_queue.put(("done", None)),
+                self.pending.loop,
+            )
+            return
+
+        # 全量 decode（含特殊 token 文本），用于 EOS 文本检测
+        raw_text = self.pending.tokenizer.decode(
             self.accumulated_ids,
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
         )
-        new_text = _SPECIAL_FILTER.sub("", new_text)
-        delta = new_text[len(self.text_so_far):]
-        self.text_so_far = new_text
 
-        if delta:
+        # ── 文本级 EOS 检测（在 sanitize 之前） ──────────────────────────────
+        eos_match = _EOS_TEXT_RE.search(raw_text)
+        if eos_match:
+            final_text = _sanitize_generated_text(raw_text[:eos_match.start()])
+            delta = final_text[len(self._text_emitted):]
+            self._text_emitted = final_text
+            self.text_so_far = final_text
+            if delta and not self._think_suppressed:
+                asyncio.run_coroutine_threadsafe(
+                    self.pending.result_queue.put(("delta", delta)),
+                    self.pending.loop,
+                )
+            self.done = True
             asyncio.run_coroutine_threadsafe(
-                self.pending.result_queue.put(("delta", delta)),
+                self.pending.result_queue.put(("done", None)),
                 self.pending.loop,
             )
+            return
+
+        new_text = _sanitize_generated_text(raw_text)
+        self.text_so_far = new_text
+
+        # ── 重复循环检测（在发送 delta 之前）────────────────────────────────
+        if self._check_repetition():
+            self.done = True
+            asyncio.run_coroutine_threadsafe(
+                self.pending.result_queue.put(("done", None)),
+                self.pending.loop,
+            )
+            return
+
+        # ── 思考预算控制 ──────────────────────────────────────────────────────
+        if not self._think_suppressed:
+            t_open = new_text.find('<think>')
+            if (self._thinking_budget > 0 and t_open >= 0
+                    and new_text.find('</think>', t_open) < 0):
+                # 正处于未关闭的 think 块内
+                think_len = len(new_text) - t_open - 7
+                if think_len > self._thinking_budget:
+                    # 思考超出预算：注入 </think> 截断，进入抑制模式
+                    asyncio.run_coroutine_threadsafe(
+                        self.pending.result_queue.put(("delta", "\n</think>\n\n")),
+                        self.pending.loop,
+                    )
+                    self._think_suppressed = True
+                    self._text_emitted = new_text
+                    if tok == self.end_token or self._step >= req.max_tokens:
+                        self.done = True
+                        asyncio.run_coroutine_threadsafe(
+                            self.pending.result_queue.put(("done", None)),
+                            self.pending.loop,
+                        )
+                    return
+
+            # 正常路径：计算并发送差量（含 hold-back 机制）
+            is_finishing = (tok == self.end_token or self._step >= req.max_tokens)
+            # 如果不是最后一步，检查尾部是否有未闭合的 <|... 部分特殊 token
+            if is_finishing:
+                safe_end = len(new_text)
+            else:
+                m = _PARTIAL_SPECIAL_TAIL.search(new_text)
+                safe_end = m.start() if m else len(new_text)
+            delta = new_text[len(self._text_emitted):safe_end]
+            self._text_emitted = new_text[:safe_end]
+            if delta:
+                asyncio.run_coroutine_threadsafe(
+                    self.pending.result_queue.put(("delta", delta)),
+                    self.pending.loop,
+                )
+        else:
+            # 思考抑制中：等待模型自然关闭 </think>
+            t_open = new_text.find('<think>')
+            if t_open >= 0 and new_text.find('</think>', t_open) >= 0:
+                # 模型已关闭思考块：恢复发送
+                t_close = new_text.find('</think>', t_open)
+                self._think_suppressed = False
+                after_close = new_text[t_close + 8:]   # 8 = len('</think>')
+                self._text_emitted = new_text
+                if after_close:
+                    asyncio.run_coroutine_threadsafe(
+                        self.pending.result_queue.put(("delta", after_close)),
+                        self.pending.loop,
+                    )
+            else:
+                # 仍在等待，推进基线指针但不发送
+                self._text_emitted = new_text
 
         if tok == self.end_token or self._step >= req.max_tokens:
             self.done = True
@@ -493,6 +686,9 @@ class ContinuousBatchScheduler:
         """
         req = pending.request
         prompt = pending.prompt_tokens
+        # 新请求开始前，清除该 session 的任何残留 abort 标志
+        with _session_abort_mu:
+            _session_abort.pop(pending.session_id, None)
         try:
             entry, matched_pos = self._pool.borrow(
                 prompt, owner_sid=pending.session_id
@@ -779,21 +975,26 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
   <div id="params">
     <label>温度
-      <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.8"
+      <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.5"
              oninput="document.getElementById('temp-val').textContent=this.value">
-      <span id="temp-val">0.8</span>
+      <span id="temp-val">0.5</span>
     </label>
-    <label>Top-K <input type="number" id="top_k" value="50" min="1" max="500"></label>
-    <label>Top-P <input type="number" id="top_p" value="0.9" min="0" max="1" step="0.05"></label>
-    <label>最大 Token <input type="number" id="max_tokens" value="512" min="1" max="4096"></label>
+    <label>Top-K <input type="number" id="top_k" value="30" min="1" max="500"></label>
+    <label>Top-P <input type="number" id="top_p" value="0.85" min="0" max="1" step="0.05"></label>
+    <label>最大 Token <input type="number" id="max_tokens" value="2048" min="1" max="4096"></label>
+    <label>思考上限 <input type="number" id="thinking_budget" value="800" min="0" max="4000"></label>
   </div>
 
   <div id="messages"></div>
 
   <div id="input-area">
-    <textarea id="user-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行…"
+    <textarea id="user-input" rows="2" placeholder="输入消息，Shift+Enter 发送，Enter 换行…"
               onkeydown="handleKey(event)"></textarea>
     <button id="send-btn" onclick="sendMessage()">发送</button>
+    <button id="stop-btn" onclick="stopGenerate()" disabled
+      style="background:#fff;color:#dc2626;border:1px solid #fca5a5;border-radius:10px;
+             padding:10px 14px;cursor:pointer;font-size:14px;font-weight:500;
+             transition:all 0.15s;">停止</button>
   </div>
 </div>
 
@@ -938,10 +1139,11 @@ function editMessage(idx) {
 
 //  发送消息 
 function handleKey(e) {
-  if (e.key === "Enter" && !e.shiftKey) {
+  if (e.key === "Enter" && e.shiftKey) {
     e.preventDefault();
     sendMessage();
   }
+  // 普通 Enter = 换行（走默认行为）
 }
 
 function sendMessage() {
@@ -967,8 +1169,10 @@ async function doGenerate() {
   session.isGenerating = true;
   session.pendingReply = "";
   // 仅对当前可见会话禁用发送按钮
-  if (currentSessionId === genSessionId)
+  if (currentSessionId === genSessionId) {
     document.getElementById("send-btn").disabled = true;
+    document.getElementById("stop-btn").disabled = false;
+  }
 
   const temperature = parseFloat(document.getElementById("temperature").value);
   const top_k = parseInt(document.getElementById("top_k").value);
@@ -990,6 +1194,7 @@ async function doGenerate() {
         model: "llaisys",
         messages: session.messages,
         temperature, top_k, top_p, max_tokens,
+        thinking_budget: parseInt(document.getElementById("thinking_budget")?.value || "800"),
         stream: true,
         session_id: genSessionId,
       }),
@@ -1037,8 +1242,28 @@ async function doGenerate() {
     if (currentSessionId === genSessionId) {
       renderMessages();
       document.getElementById("send-btn").disabled = false;
+      document.getElementById("stop-btn").disabled = true;
     }
   }
+}
+
+async function stopGenerate() {
+  const sess = sessions[currentSessionId];
+  if (!sess || !sess.isGenerating) return;
+  // 通知服务端中止
+  fetch(`${SERVER}/v1/sessions/${currentSessionId}/abort`, { method: "POST" }).catch(() => {});
+  // 更新 UI
+  const reply = sess.pendingReply || "[已停止]";
+  sess.isGenerating = false;
+  sess.pendingReply = "";
+  if (sess._bubble && document.body.contains(sess._bubble))
+    sess._bubble.textContent = reply;
+  sess._bubble = null;
+  sess.messages.push({ role: "assistant", content: reply });
+  saveSessions();
+  document.getElementById("send-btn").disabled = false;
+  document.getElementById("stop-btn").disabled = true;
+  renderMessages();
 }
 
 //  初始化 
@@ -1201,6 +1426,14 @@ def clear_session(session_id: str):
     """清除指定会话的 KV-Cache（会话切换时调用）。"""
     if _server is not None:
         _server.clear_session(session_id)
+    return {"status": "ok", "session_id": session_id}
+
+
+@app.post("/v1/sessions/{session_id}/abort")
+def abort_session(session_id: str):
+    """中止指定会话的当前生成（最多延迟 1-2 个 token 后停止）。"""
+    with _session_abort_mu:
+        _session_abort[session_id] = True
     return {"status": "ok", "session_id": session_id}
 
 
