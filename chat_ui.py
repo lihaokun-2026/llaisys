@@ -196,22 +196,57 @@ def render_sidebar(conversations: list, current_id: str) -> str:
         cls   = "hi active" if conv["id"] == current_id else "hi"
         title = _html.escape((conv.get("title") or "新对话")[:26])
         cid   = conv["id"]
+        # 使用 data 属性存储 session id
         items += (
-            f'<div class="{cls}" onclick="__llaSel(\'{cid}\')">'
+            f'<div class="{cls}" data-sid="{cid}" onclick="window.__llaHandleClick(event, \'{cid}\')">'
             f'<svg class="hico" viewBox="0 0 16 16"><path d="M8 1.5c-3.59 0-6.5 '
             f'2.69-6.5 6s2.91 6 6.5 6a6.4 6.4 0 002.8-.64l2.7.82-.83-2.56A5.84 '
             f'5.84 0 0014.5 7.5c0-3.31-2.91-6-6.5-6z" stroke="currentColor" '
-            f'stroke-width="1.2" fill="none"/></svg>'
+            f'stroke-width="1.2" fill="none"/>'
             f'<span class="hti">{title}</span>'
             f'</div>\n'
         )
     if not items:
         items = '<div class="hempty">暂无历史对话</div>'
-    # __llaSel 在 demo.launch(js=) 中全局注册，此处无需重复注入 <script>
     return f'<div id="hsc">{items}</div>'
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# CSS — 豆包全屏布局
+# 注入到 <head> 的 JS 代码 - 确保在页面加载时就执行
 # ─────────────────────────────────────────────────────────────────────────────
+
+_HEAD_JS = """
+(function() {
+    console.log('[LLA] === Head JS loading ===');
+    
+    // 历史对话点击处理函数
+    window.__llaHandleClick = function(event, sid) {
+        console.log('[LLA] Click handler called with sid:', sid);
+        event.preventDefault();
+        event.stopPropagation();
+        
+        // 查找隐藏的 textbox
+        var input = document.querySelector('#hcb input');
+        console.log('[LLA] Found input:', !!input);
+        if (!input) {
+            input = document.querySelector('#hcb textarea');
+        }
+        if (!input) {
+            console.log('[LLA] ERROR: No input found');
+            return;
+        }
+        
+        // 设置值并触发事件
+        console.log('[LLA] Setting value to:', sid);
+        input.value = sid;
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+        input.dispatchEvent(new Event('change', {bubbles: true}));
+        console.log('[LLA] Events dispatched');
+    };
+    
+    console.log('[LLA] Head JS loaded, window.__llaHandleClick:', typeof window.__llaHandleClick);
+})();
+"""
 
 CSS = """
 /* ══ RESET & FULL PAGE ═══════════════════════════════════════════════════════ */
@@ -309,9 +344,8 @@ footer { display: none !important; }
 .hempty { color: #9ca3af !important; font-size: 12px !important;
     text-align: center !important; padding: 24px 0 !important; }
 
-/* Hidden JS click receiver — offscreen but still in DOM for JS access */
-#hcb { position: absolute !important; left: -9999px !important;
-    width: 1px !important; height: 1px !important; overflow: hidden !important; }
+/* Hidden textbox for JS click events - keep in DOM but invisible */
+#hcb { opacity: 0 !important; position: absolute !important; }
 
 /* 侧边栏 & 右侧参数面板：不被全局 overflow:hidden 截断 */
 #sidebar .wrap, #sidebar .contain,
@@ -562,7 +596,9 @@ def respond(user_msg, history, session_id, server_url,
                     delta = json.loads(payload)["choices"][0]["delta"].get("content", "")
                     if delta:
                         full_text += delta
-                        history[-1]["content"] = _normalize_think(_clean(full_text))
+                        # 实时更新：确保 think 标签完整，流式显示
+                        normalized_text = _normalize_think(_clean(full_text))
+                        history[-1]["content"] = normalized_text
                         yield history, "", conversations, pre_sidebar, pre_title
                 except Exception:
                     pass
@@ -571,8 +607,10 @@ def respond(user_msg, history, session_id, server_url,
         yield history, "", conversations, pre_sidebar, pre_title
         return
 
-    history[-1]["content"] = _normalize_think(_trim_repetition(_clean(full_text)))
-    # 生成完毕：更新历史记录和侧边栏
+    # 生成完毕：确保 think 标签闭合，去除重复内容
+    final_text = _normalize_think(_trim_repetition(_clean(full_text)))
+    history[-1]["content"] = final_text
+    # 更新历史记录和侧边栏
     updated_convs = _update_conversations(conversations, session_id, history)
     new_title     = _conv_title(history)
     new_sidebar   = render_sidebar(updated_convs, session_id)
@@ -611,15 +649,21 @@ def do_new_session(conversations):
 
 
 def on_history_click(conv_id, conversations, server_url):
+    """处理历史对话点击切换事件。"""
     if not conv_id:
-        return gr.update(), gr.update(), gr.update(), gr.update(), gr.update(), ""
+        return [], gr.update(), gr.update(), gr.update(), ""
+    
+    # 查找对应的会话
     for conv in conversations:
         if conv["id"] == conv_id:
             msgs    = conv.get("messages", [])
             title   = conv.get("title") or "新对话"
             sidebar = render_sidebar(conversations, conv_id)
-            return msgs, conv_id, "", sidebar, title, ""
-    return [], conv_id, "", render_sidebar(conversations, conv_id), "新对话", ""
+            # 返回：chatbot 消息，session_id, sidebar HTML, 标题，清空 hist_click
+            return msgs, conv_id, sidebar, title, ""
+    
+    # 未找到会话，返回空
+    return [], conv_id, render_sidebar(conversations, conv_id), "新对话", ""
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -628,33 +672,47 @@ def on_history_click(conv_id, conversations, server_url):
 
 _JS_ENTER_SEND = """
 () => {
-    // ── Shift+Enter 发送，Enter 换行 ────────────────────────────────────────
+    console.log('[LLA] === Global JS loading ===');
+    
+    // ── Enter 发送，Shift+Enter 换行 ────────────────────────────────────────
     document.addEventListener('keydown', function(e) {
         var ta = document.querySelector('#msg-input textarea');
         if (!ta || e.target !== ta || e.key !== 'Enter') return;
         if (e.shiftKey) {
-            // Shift+Enter = 发送
-            e.preventDefault();
-            e.stopPropagation();
-            var btn = document.querySelector('#send-btn button');
-            if (btn && !btn.disabled) btn.click();
             return;
         }
-        // 普通 Enter = 换行（不拦截，走默认行为）
+        e.preventDefault();
+        e.stopPropagation();
+        var btn = document.querySelector('#send-btn button');
+        if (btn && !btn.disabled) btn.click();
     }, true);
 
-    // ── 历史对话切换：全局注册，供侧边栏 onclick 调用 ─────────────────────
-    // Gradio 用 React 受控输入，必须通过原生 setter 触发 input 事件才有效
-    window.__llaSel = function(id) {
-        var e = document.querySelector('#hcb textarea')
-                || document.querySelector('#hcb input');
-        if (!e) return;
-        var proto = e.tagName === 'TEXTAREA'
-            ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-        var setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
-        setter.call(e, id);
-        e.dispatchEvent(new Event('input', {bubbles: true}));
+    // ── 历史对话点击处理函数 ───────────────────────────────────────
+    window.__llaHandleClick = function(event, sid) {
+        console.log('[LLA] Click handler called with sid:', sid);
+        event.preventDefault();
+        event.stopPropagation();
+        
+        // 查找隐藏的 textbox
+        var input = document.querySelector('#hcb input');
+        console.log('[LLA] Found input:', !!input);
+        if (!input) {
+            input = document.querySelector('#hcb textarea');
+        }
+        if (!input) {
+            console.log('[LLA] ERROR: No input found');
+            return;
+        }
+        
+        // 设置值并触发事件
+        console.log('[LLA] Setting value to:', sid);
+        input.value = sid;
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+        input.dispatchEvent(new Event('change', {bubbles: true}));
+        console.log('[LLA] Events dispatched');
     };
+    
+    console.log('[LLA] Global JS loaded, window.__llaHandleClick:', typeof window.__llaHandleClick);
 }
 """
 
@@ -700,8 +758,8 @@ def build_ui(server_url: str) -> gr.Blocks:
                     elem_id="sb-hist",
                 )
 
-                # 隐藏的 textbox，接收侧边栏 JS 点击事件（CSS offscreen 隐藏，保留 DOM）
-                hist_click = gr.Textbox(value="", show_label=False, container=False, elem_id="hcb")
+                # 隐藏的 textbox，接收侧边栏 JS 点击事件（用 CSS 隐藏而不是 visible=False）
+                hist_click = gr.Textbox(value="", show_label=False, elem_id="hcb")
 
                 with gr.Row(elem_id="sb-bot"):
                     gr.Markdown("👤 &nbsp;LLAISYS User")
@@ -738,7 +796,7 @@ def build_ui(server_url: str) -> gr.Blocks:
                 # 输入行
                 with gr.Row(elem_id="inp-zone"):
                     msg_box = gr.Textbox(
-                        placeholder="发消息给 LLAISYS…（Shift+Enter 发送，Enter 换行）",
+                        placeholder="发消息给 LLAISYS…（Enter 发送，Shift+Enter 换行）",
                         show_label=False, lines=2, max_lines=8,
                         scale=9, container=False, autofocus=True,
                         elem_id="msg-input",
@@ -821,10 +879,11 @@ def build_ui(server_url: str) -> gr.Blocks:
             outputs=[chatbot, msg_box, session_id_st, history_html, conv_title_md],
         )
 
-        hist_click.input(
+        # 历史对话点击切换：使用 .change() 事件（比 .input 更可靠）
+        hist_click.change(
             on_history_click,
             inputs=[hist_click, conversations_st, server_url_st],
-            outputs=[chatbot, session_id_st, msg_box, history_html, conv_title_md, hist_click],
+            outputs=[chatbot, session_id_st, history_html, conv_title_md, msg_box],
         )
 
         # 每次浏览器连接/刷新时从磁盘重新加载历史，避免刷新后丢失会话
@@ -870,8 +929,7 @@ def main():
             neutral_hue=gr.themes.colors.gray,
         ),
         css=CSS,
-        js=_JS_ENTER_SEND,
-    )
+        js=_JS_ENTER_SEND,        head='<script>' + _HEAD_JS + '</script>',    )
 
 
 if __name__ == "__main__":

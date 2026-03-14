@@ -144,6 +144,8 @@ def stream_chat(
     buf = ""
     # hold-back 缓冲：缓存可能是特殊 token 不完整前缀的尾部
     _hold = ""
+    # 思考标签状态跟踪
+    _in_think = False
 
     for raw in resp.iter_content(chunk_size=None):
         if not raw:
@@ -164,6 +166,13 @@ def stream_chat(
                     continue
                 # 拼入 hold-back 缓冲
                 _hold += delta
+                
+                # 跟踪 think 标签状态
+                if "<think>" in _hold and not _in_think:
+                    _in_think = True
+                if "</think>" in _hold and _in_think:
+                    _in_think = False
+                
                 # 检测是否包含完整 EOS 标记
                 eos_m = _EOS_TOKEN_RE.search(_hold)
                 if eos_m:
@@ -177,7 +186,10 @@ def stream_chat(
                     safe = _hold
                     _hold = ""
                 if safe:
-                    # 清洗完整特殊 token
+                    # 清洗完整特殊 token（但保留 think 标签）
+                    # 先移除 EOS 标记，保留 <think>...</think>
+                    safe = _EOS_TOKEN_RE.sub("", safe)
+                    # 移除其他特殊 token，但保留 <think> 和 </think>
                     safe = _SPECIAL_TOKEN_RE.sub("", safe)
                     print(safe, end="", flush=True)
                     reply += safe
@@ -192,6 +204,11 @@ def stream_chat(
         if _hold:
             print(_hold, end="", flush=True)
             reply += _hold
+
+    # 确保 think 标签闭合：如果流式结束时仍在 think 块内，自动闭合
+    if _in_think:
+        print("\n</think>", end="", flush=True)
+        reply += "\n</think>"
 
     print()  # 换行
     return _clean_reply(reply)
@@ -244,7 +261,8 @@ def chat_loop(server: str, default_session_id: str):
     max_tokens = 512
 
     print(f"LLAISYS Chat CLI — 服务器: {server}")
-    print("输入 /help 查看命令列表，Ctrl-C 或 /quit 退出。\n")
+    print("输入 /help 查看命令列表，Ctrl-C 或 /quit 退出。")
+    print("提示：Enter 发送，Shift+Enter 换行（需要 prompt_toolkit 支持）\n")
 
     while True:
         # 提示符
