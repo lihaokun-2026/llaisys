@@ -975,12 +975,12 @@ WEB_UI_HTML = """<!DOCTYPE html>
 
   <div id="params">
     <label>温度
-      <input type="range" id="temperature" min="0" max="2" step="0.1" value="0.5"
+      <input type="range" id="temperature" min="0" max="2" step="0.1" value="1"
              oninput="document.getElementById('temp-val').textContent=this.value">
       <span id="temp-val">0.5</span>
     </label>
     <label>Top-K <input type="number" id="top_k" value="30" min="1" max="500"></label>
-    <label>Top-P <input type="number" id="top_p" value="0.85" min="0" max="1" step="0.05"></label>
+    <label>Top-P <input type="number" id="top_p" value="0.9" min="0" max="1" step="0.05"></label>
     <label>最大 Token <input type="number" id="max_tokens" value="2048" min="1" max="4096"></label>
     <label>思考上限 <input type="number" id="thinking_budget" value="800" min="0" max="4000"></label>
   </div>

@@ -776,20 +776,20 @@ def build_ui(server_url: str) -> gr.Blocks:
             with gr.Column(scale=0, min_width=260, elem_id="rp-col"):
                 gr.Markdown("### ⚙️  生成参数")
                 temperature = gr.Slider(
-                    minimum=0.0, maximum=2.0, value=0.5, step=0.05,
+                    minimum=0.0, maximum=2.0, value=1, step=0.05,
                     label="温度 Temperature", info="↑ 更随机 · ↓ 更保守",
                 )
                 top_k = gr.Slider(
                     minimum=1, maximum=200, value=30, step=1, label="Top-K",
                 )
                 top_p = gr.Slider(
-                    minimum=0.0, maximum=1.0, value=0.85, step=0.05, label="Top-P  核采样",
+                    minimum=0.0, maximum=1.0, value=0.9, step=0.05, label="Top-P  核采样",
                 )
                 max_tokens = gr.Slider(
                     minimum=64, maximum=4096, value=2048, step=64, label="最大 Token 数",
                 )
                 thinking_budget = gr.Slider(
-                    minimum=0, maximum=3000, value=800, step=100,
+                    minimum=0, maximum=3000, value=2000, step=100,
                     label="思考限额 (think 块最多字符数)",
                     info="0 = 不限制",
                 )
